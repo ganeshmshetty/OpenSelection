@@ -38,7 +38,7 @@ In `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(path: "../OpenSelection") // or git URL
+    .package(url: "https://github.com/ganeshmshetty/OpenSelection.git", from: "0.1.0")
 ]
 ```
 
@@ -53,7 +53,6 @@ Or in Xcode, add the package dependency pointing to the repository.
 ```swift
 import OpenSelection
 
-// Get currently selected text from frontmost app
 if let text = await OpenSelection.selectedText() {
     print("Selected text: \(text)")
 }
