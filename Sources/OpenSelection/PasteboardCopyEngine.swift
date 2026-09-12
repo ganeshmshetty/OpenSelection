@@ -1,0 +1,100 @@
+// PasteboardCopyEngine.swift
+// OpenSelection
+//
+// Standalone clipboard capture engine: archives pasteboard types, runs a copy
+// trigger, polls for a changeCount advance with non-empty string content, then
+// restores the original items tagged with transient markers.
+import AppKit
+import Foundation
+
+@MainActor
+public struct PasteboardCopyEngine {
+    public typealias CopyTrigger = @MainActor () -> Void
+
+    private let configuration: SelectionConfiguration
+
+    public init(configuration: SelectionConfiguration = .default) {
+        self.configuration = configuration
+    }
+
+    /// Runs `trigger` between archiving the pasteboard and polling for a change.
+    public func capture(
+        pasteboard: NSPasteboard = .general,
+        timeout: TimeInterval? = nil,
+        restoreDelay: TimeInterval? = nil,
+        trigger: CopyTrigger
+    ) async -> SelectionResult? {
+        let snapshot = PasteboardSnapshot.capture(pasteboard)
+        let initialChangeCount = pasteboard.changeCount
+
+        trigger()
+
+        let resolvedTimeout = timeout ?? Self.pollingTimeout(for: NSWorkspace.shared.frontmostApplication?.bundleIdentifier, configuration: configuration)
+        let pollInterval: TimeInterval = 0.002
+        let deadline = Date().addingTimeInterval(resolvedTimeout)
+        var result: SelectionResult?
+
+        while Date() < deadline && !Task.isCancelled {
+            if pasteboard.changeCount != initialChangeCount {
+                if let candidate = pasteboard.string(forType: .string),
+                   Self.hasSelection(candidate) {
+                    let html = pasteboard.string(forType: .html) ?? Self.htmlFromRTF(pasteboard)
+                    let rtf = pasteboard.string(forType: .rtf)
+                    result = SelectionResult(
+                        text: candidate,
+                        bounds: nil,
+                        html: html,
+                        rtf: rtf,
+                        strategy: .keyboardCopy,
+                        isEditable: false
+                    )
+                    break
+                }
+            }
+            try? await Task.sleep(nanoseconds: UInt64(pollInterval * 1_000_000_000))
+        }
+
+        guard let result else {
+            if pasteboard.changeCount != initialChangeCount {
+                OpenSelectionLogging.log("copy engine: no non-empty pasteboard text within deadline; restoring immediately")
+                snapshot.restore(to: pasteboard, transientMarkers: true)
+            }
+            return nil
+        }
+
+        snapshot.restore(to: pasteboard, transientMarkers: true)
+        return result
+    }
+
+    /// Per-app copy polling timeout. Browsers need more time for IPC clipboard operations to stabilize.
+    public static func pollingTimeout(
+        for bundleID: String?,
+        configuration: SelectionConfiguration = .default
+    ) -> TimeInterval {
+        guard let bundleID else { return configuration.pasteboardCopyTimeout }
+        if isBrowser(bundleID) {
+            return configuration.safariPasteboardCopyTimeout
+        }
+        return configuration.pasteboardCopyTimeout
+    }
+
+    public static func isBrowser(_ bundleID: String) -> Bool {
+        AppMatching.isBrowser(bundleID)
+    }
+
+    /// Returns `true` only when `text` is non-nil and contains visible, substantial characters.
+    public static func hasSelection(_ text: String?) -> Bool {
+        TextSanitizer.isSubstantial(text)
+    }
+
+    /// Converts a pasteboard's RTF data into HTML.
+    private static func htmlFromRTF(_ pasteboard: NSPasteboard) -> String? {
+        guard let rtfData = pasteboard.data(forType: .rtf),
+              let attributed = NSAttributedString(rtf: rtfData, documentAttributes: nil),
+              let htmlData = try? attributed.data(
+                  from: NSRange(location: 0, length: attributed.length),
+                  documentAttributes: [.documentType: NSAttributedString.DocumentType.html]
+              ) else { return nil }
+        return String(data: htmlData, encoding: .utf8)
+    }
+}

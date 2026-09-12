@@ -1,0 +1,45 @@
+// AXTextControlStrategy.swift
+// OpenSelection
+//
+// Reads selected text and bounds for native text controls from an
+// AXElementInspector.Target snapshot.
+import ApplicationServices
+import Foundation
+
+public enum AXTextControlStrategy {
+    /// kAXSelectedTextAttribute, falling back to value + selectedTextRange substring.
+    public static func read(from target: AXElementInspector.Target) -> SelectionResult? {
+        if let text = target.selectedText, TextSanitizer.isSubstantial(text) {
+            return SelectionResult(
+                text: text,
+                bounds: target.bounds,
+                strategy: .axTextControl,
+                isEditable: true
+            )
+        }
+
+        guard let fullValue = target.value, !fullValue.isEmpty,
+              let rangeValue = target.selectedTextRange,
+              CFGetTypeID(rangeValue) == AXValueGetTypeID() else { return nil }
+
+        var cfRange = CFRange()
+        guard AXValueGetValue(rangeValue as! AXValue, .cfRange, &cfRange),
+              cfRange.length > 0,
+              cfRange.location >= 0,
+              cfRange.location + cfRange.length <= fullValue.utf16.count else { return nil }
+
+        // AXValueGetValue reports UTF-16 code-unit offsets, so index via the UTF-16 view rather
+        // than Character-based offsets (which would mis-slice multi-byte strings).
+        let start = String.Index(utf16Offset: cfRange.location, in: fullValue)
+        let end = String.Index(utf16Offset: cfRange.location + cfRange.length, in: fullValue)
+        let substring = String(fullValue[start..<end])
+        guard TextSanitizer.isSubstantial(substring) else { return nil }
+
+        return SelectionResult(
+            text: substring,
+            bounds: target.bounds,
+            strategy: .axTextControl,
+            isEditable: true
+        )
+    }
+}

@@ -1,0 +1,11 @@
+OpenSelection
+Copyright 2026 Ganesh M.
+
+This product includes software developed as part of OpenClip
+(https://github.com/ganeshmshetty/openclip).
+
+Attribution & Acknowledgments:
+- OpenClip contributors for selection retrieval architecture, accessibility inspection,
+  and concurrency gating.
+- SelectedTextKit for the multi-tiered selection retrieval concept and accessibility fallback cascades.
+- Copi for insights into macOS pasteboard snapshotting, transient marker tagging, and clipboard restoration.
