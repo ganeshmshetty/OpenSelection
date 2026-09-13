@@ -262,7 +262,7 @@ public struct SelectionRetrievalCoordinator: Sendable {
             }
             return [.axTextControl, .keyboardCopy]
 
-        case .axWebArea:
+        case .axWebArea, .browserScript:
             return [.axWebArea, .keyboardCopy]
 
         case .menuCopy:
@@ -307,6 +307,9 @@ public struct SelectionRetrievalCoordinator: Sendable {
         case .officeScript:
             return await runOfficeScript(for: app, target: target)
 
+        case .browserScript:
+            return nil
+
         case .menuCopy, .keyboardCopy:
             let trigger: CopyTrigger
             switch strategy {
@@ -325,14 +328,6 @@ public struct SelectionRetrievalCoordinator: Sendable {
                     }
                 }
             case .keyboardCopy:
-                if let focusedApp = target.focusedApp,
-                   AXMenuNavigator.findMenuItem(.copy, in: focusedApp, requireEnabled: false, timeout: configuration.axReadTimeout) != nil {
-                    let isEnabled = AXMenuNavigator.findMenuItem(.copy, in: focusedApp, requireEnabled: true, timeout: configuration.axReadTimeout) != nil
-                    guard isEnabled else {
-                        OpenSelectionLogging.log("coordinator: Edit ▸ Copy is disabled; skipping keyboardCopy")
-                        return nil
-                    }
-                }
                 let copyKey = configuration.copyVirtualKey
                 trigger = { KeyboardEventPoster.postKey(keyCode: copyKey, flags: .maskCommand) }
             default:

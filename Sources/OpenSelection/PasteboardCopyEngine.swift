@@ -66,16 +66,20 @@ public struct PasteboardCopyEngine {
         return result
     }
 
-    /// Per-app copy polling timeout. Browsers need more time for IPC clipboard operations to stabilize.
+    /// Per-app copy polling timeout. Browsers and Electron apps need more time for multi-process IPC clipboard operations to stabilize.
     public static func pollingTimeout(
         for bundleID: String?,
         configuration: SelectionConfiguration = .default
     ) -> TimeInterval {
         guard let bundleID else { return configuration.pasteboardCopyTimeout }
-        if isBrowser(bundleID) {
+        if isMultiProcess(bundleID) {
             return configuration.safariPasteboardCopyTimeout
         }
         return configuration.pasteboardCopyTimeout
+    }
+
+    public static func isMultiProcess(_ bundleID: String) -> Bool {
+        AppMatching.isMultiProcess(bundleID)
     }
 
     public static func isBrowser(_ bundleID: String) -> Bool {

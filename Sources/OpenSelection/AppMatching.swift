@@ -59,11 +59,39 @@ public enum AppMatching: Sendable {
         "company.thebrowser.*"
     ]
 
+    public static let electronGroup: [String] = [
+        "com.microsoft.VSCode",
+        "com.microsoft.VSCodeInsiders",
+        "com.vscodium",
+        "com.visualstudio.code.oss",
+        "com.cursor.*",
+        "com.exafunction.windsurf",
+        "com.codeium.windsurf",
+        "cn.trae.app",
+        "com.byteplus.trae",
+        "md.obsidian",
+        "notion.id",
+        "com.tinyspeck.slackmacgap",
+        "com.hnc.Discord*",
+        "com.linear*",
+        "com.figma.Desktop",
+        "com.postmanlabs.mac",
+        "com.github.GitHubClient",
+        "org.whispersystems.signal-desktop",
+        "com.mattermost.Mattermost",
+        "com.todesktop.*"
+    ]
+
     public static let browserPatterns: [String] = safariGroup + chromiumGroup + firefoxGroup + arcGroup
 
     public static func isBrowser(_ bundleID: String?) -> Bool {
         guard let bundleID else { return false }
         return matchesAny(browserPatterns, bundleID: bundleID)
+    }
+
+    public static func isMultiProcess(_ bundleID: String?) -> Bool {
+        guard let bundleID else { return false }
+        return isBrowser(bundleID) || matchesAny(electronGroup, bundleID: bundleID)
     }
 
     public static let microsoftOfficeGroup: [String] = [

@@ -7,6 +7,7 @@ import Foundation
 public enum SelectionStrategy: String, Codable, Sendable, CaseIterable {
     case axTextControl = "ax-text-control"
     case axWebArea = "ax-web-area"
+    case browserScript = "browser-script"
     case menuCopy = "menu-copy"
     case keyboardCopy = "keyboard-copy"
     case officeScript = "office-script"

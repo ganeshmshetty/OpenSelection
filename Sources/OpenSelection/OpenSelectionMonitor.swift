@@ -71,8 +71,8 @@ public final class OpenSelectionMonitor {
         0x74, 0x79                // page up / page down
     ]
 
-    /// Squared drag threshold (>5pt movement)
-    public static let dragThresholdSquared: CGFloat = 25.0
+    /// Squared drag threshold (>3pt movement)
+    public static let dragThresholdSquared: CGFloat = 9.0
     public static let holdDragDisarmSquared: CGFloat = 25.0
     public static let holdFireDriftSquared: CGFloat = 4.0
 
