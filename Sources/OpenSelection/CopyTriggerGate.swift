@@ -30,23 +30,32 @@ public enum CopyTriggerGate {
         windows: [OnScreenWindowInfo],
         at point: CGPoint,
         frontmostPID: pid_t?,
-        selfPID: pid_t
+        selfPID: pid_t,
+        displayBounds: CGRect? = nil
     ) -> Bool {
         guard let frontmostPID else { return false }
         guard let top = windows.first(where: { $0.layer >= 0 && $0.frame.contains(point) }) else { return false }
         if top.ownerPID == selfPID { return false }   // our own popup is not a foreign overlay
-        return top.ownerPID != frontmostPID
+        if top.ownerPID != frontmostPID { return true }
+        // A capture tool can *activate itself* while its picker is up (CleanShot X reports as
+        // frontmost), so the owner mismatch never fires. Detect it structurally instead: the
+        // frontmost app's own top window is an elevated, display-covering overlay, not a document.
+        guard let displayBounds else { return false }
+        let coversDisplay = top.frame.width >= displayBounds.width - 1 && top.frame.height >= displayBounds.height - 1
+        return top.layer > 0 && coversDisplay
     }
 
     /// True when a foreign overlay sits at `point` right now. Inert under XCTest so unit tests never
     /// depend on the live window server; the pure `isForeignOverlay` is exercised directly instead.
     public static func isForeignOverlayPresent(at point: CGPoint) -> Bool {
         guard NSClassFromString("XCTestCase") == nil else { return false }
+        let display = NSScreen.screens.first(where: { $0.frame.contains(point) })?.frame
         return isForeignOverlay(
             windows: systemWindows(),
             at: point,
             frontmostPID: NSWorkspace.shared.frontmostApplication?.processIdentifier,
-            selfPID: ProcessInfo.processInfo.processIdentifier
+            selfPID: ProcessInfo.processInfo.processIdentifier,
+            displayBounds: display
         )
     }
 
