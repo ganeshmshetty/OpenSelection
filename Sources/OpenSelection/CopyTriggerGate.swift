@@ -26,6 +26,13 @@ public struct OnScreenWindowInfo: Equatable, Sendable {
 
 public enum CopyTriggerGate {
     /// Pure decision over a front-to-back window list. Unknown inputs never suppress (fail open).
+    ///
+    /// The only window that can swallow the synthetic ⌘C is one that owns the key window: an
+    /// *elevated* window that *covers the display* — the profile of a capture/annotation tool's
+    /// full-screen picker, whether it belongs to another app or activates itself (CleanShot X).
+    /// Windows that merely float above the point at a smaller size — a notch/HUD app's panel
+    /// (NotchNook), the Dock, a menu, a tooltip, an Electron helper window — never receive the
+    /// copy, and treating them as overlays silently dropped legitimate selections.
     public static func isForeignOverlay(
         windows: [OnScreenWindowInfo],
         at point: CGPoint,
@@ -33,15 +40,12 @@ public enum CopyTriggerGate {
         selfPID: pid_t,
         displayBounds: CGRect? = nil
     ) -> Bool {
-        guard let frontmostPID else { return false }
+        // Without a known frontmost app or display there is nothing to reason about: fail open.
+        guard frontmostPID != nil, let displayBounds else { return false }
         guard let top = windows.first(where: { $0.layer >= 0 && $0.frame.contains(point) }) else { return false }
         if top.ownerPID == selfPID { return false }   // our own popup is not a foreign overlay
-        if top.ownerPID != frontmostPID { return true }
-        // A capture tool can *activate itself* while its picker is up (CleanShot X reports as
-        // frontmost), so the owner mismatch never fires. Detect it structurally instead: the
-        // frontmost app's own top window is an elevated, display-covering overlay, not a document.
-        guard let displayBounds else { return false }
-        let coversDisplay = top.frame.width >= displayBounds.width - 1 && top.frame.height >= displayBounds.height - 1
+        let coversDisplay = top.frame.width >= displayBounds.width - 1
+            && top.frame.height >= displayBounds.height - 1
         return top.layer > 0 && coversDisplay
     }
 
@@ -50,13 +54,27 @@ public enum CopyTriggerGate {
     public static func isForeignOverlayPresent(at point: CGPoint) -> Bool {
         guard NSClassFromString("XCTestCase") == nil else { return false }
         let display = NSScreen.screens.first(where: { $0.frame.contains(point) })?.frame
-        return isForeignOverlay(
-            windows: systemWindows(),
+        let windows = systemWindows()
+        let frontmostPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let suppressed = isForeignOverlay(
+            windows: windows,
             at: point,
-            frontmostPID: NSWorkspace.shared.frontmostApplication?.processIdentifier,
+            frontmostPID: frontmostPID,
             selfPID: ProcessInfo.processInfo.processIdentifier,
             displayBounds: display
         )
+        // Log the decision inputs only when we refuse, so a false positive is diagnosable from a
+        // user's log dump instead of being an invisible "no selection".
+        if suppressed {
+            let top = windows.first { $0.layer >= 0 && $0.frame.contains(point) }
+            let topDescription = top.map {
+                "owner=\($0.ownerPID) layer=\($0.layer) frame=(\(Int($0.frame.minX)),\(Int($0.frame.minY))) \(Int($0.frame.width))x\(Int($0.frame.height))"
+            } ?? "none"
+            OpenSelectionLogging.log(
+                "copy gate: suppressed at (\(Int(point.x)),\(Int(point.y))) — frontmost=\(frontmostPID.map(String.init) ?? "nil") self=\(ProcessInfo.processInfo.processIdentifier) top[\(topDescription)]"
+            )
+        }
+        return suppressed
     }
 
     /// Reads the live on-screen window list, ordered front-to-back, converting `CGWindowList`'s
