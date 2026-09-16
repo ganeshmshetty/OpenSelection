@@ -10,11 +10,21 @@ import Foundation
 @MainActor
 public struct PasteboardCopyEngine {
     public typealias CopyTrigger = @MainActor () -> Void
+    /// Answers whether it is safe to post a synthetic copy that will be delivered to the current key
+    /// window. Defaults to the system overlay gate (see `CopyTriggerGate`).
+    public typealias CopyAuthorization = @MainActor () -> Bool
 
     private let configuration: SelectionConfiguration
+    private let isCopyAuthorized: CopyAuthorization
 
-    public init(configuration: SelectionConfiguration = .default) {
+    public init(
+        configuration: SelectionConfiguration = .default,
+        isCopyAuthorized: @escaping CopyAuthorization = {
+            !CopyTriggerGate.isForeignOverlayPresent(at: NSEvent.mouseLocation)
+        }
+    ) {
         self.configuration = configuration
+        self.isCopyAuthorized = isCopyAuthorized
     }
 
     /// Runs `trigger` between archiving the pasteboard and polling for a change.
@@ -24,6 +34,13 @@ public struct PasteboardCopyEngine {
         restoreDelay: TimeInterval? = nil,
         trigger: CopyTrigger
     ) async -> SelectionResult? {
+        // Refuse before posting anything: a key window owned by another app means the synthetic ⌘C
+        // would fire that overlay's shortcut and tear it down instead of reaching the target app.
+        guard isCopyAuthorized() else {
+            OpenSelectionLogging.log("copy engine: suppressed — a foreign overlay owns the key window")
+            return nil
+        }
+
         let snapshot = PasteboardSnapshot.capture(pasteboard)
         let initialChangeCount = pasteboard.changeCount
 

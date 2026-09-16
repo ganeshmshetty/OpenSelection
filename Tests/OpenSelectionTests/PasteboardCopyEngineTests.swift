@@ -115,6 +115,28 @@ final class PasteboardCopyEngineTests: XCTestCase {
         XCTAssertEqual(PasteboardCopyEngine.pollingTimeout(for: "com.google.Chrome"), SelectionConfiguration.default.safariPasteboardCopyTimeout)
         XCTAssertEqual(PasteboardCopyEngine.pollingTimeout(for: "com.apple.TextEdit"), SelectionConfiguration.default.pasteboardCopyTimeout)
     }
+
+    /// Regression (macshot / CleanShot): when a foreign overlay owns the key window, the copy must
+    /// not be posted at all — the ⌘C would fire the overlay's own shortcut and tear the capture down.
+    @MainActor
+    func testCaptureSuppressedWhenCopyNotAuthorized() async {
+        let pasteboard = makePasteboard()
+        pasteboard.setString("Original", forType: .string)
+        let initialChangeCount = pasteboard.changeCount
+
+        var triggered = false
+        let engine = PasteboardCopyEngine(isCopyAuthorized: { false })
+        let captured = await engine.capture(pasteboard: pasteboard) {
+            triggered = true
+            pasteboard.clearContents()
+            pasteboard.setString("Copied", forType: .string)
+        }
+
+        XCTAssertNil(captured)
+        XCTAssertFalse(triggered, "the copy trigger must not run while a foreign overlay owns the key window")
+        XCTAssertEqual(pasteboard.changeCount, initialChangeCount)
+        XCTAssertEqual(pasteboard.string(forType: .string), "Original")
+    }
 }
 
 private final class DummyLazyDataProvider: NSObject, NSPasteboardItemDataProvider {
