@@ -47,6 +47,29 @@ final class PasteboardCopyEngineTests: XCTestCase {
     }
 
     @MainActor
+    func testCapturePreservesEveryFlavorIncludingProprietaryTypes() async throws {
+        let pasteboard = makePasteboard()
+        pasteboard.setString("Original", forType: .string)
+        let proprietaryType = NSPasteboard.PasteboardType("com.apple.notes.richtext")
+        let proprietaryData = Data([0x00, 0x01, 0xFE, 0xFF])
+
+        let engine = PasteboardCopyEngine()
+        let captured = await engine.capture(pasteboard: pasteboard) {
+            pasteboard.clearContents()
+            let item = NSPasteboardItem()
+            item.setString("Checklist", forType: .string)
+            item.setData(Data("{\\rtf1 x}".utf8), forType: .rtf)
+            item.setData(proprietaryData, forType: proprietaryType)
+            pasteboard.writeObjects([item])
+        }
+
+        let flavors = try XCTUnwrap(captured?.flavors)
+        XCTAssertEqual(flavors.first { $0.type == "com.apple.notes.richtext" }?.data, proprietaryData)
+        XCTAssertEqual(flavors.first { $0.type == "public.rtf" }?.data, Data("{\\rtf1 x}".utf8))
+        XCTAssertFalse(flavors.contains { $0.type == "org.nspasteboard.TransientType" })
+    }
+
+    @MainActor
     func testTimeoutWithUntouchedPasteboardDoesNotRestoreOrAlterChangeCount() async throws {
         let pasteboard = makePasteboard()
         pasteboard.setString("Original", forType: .string)

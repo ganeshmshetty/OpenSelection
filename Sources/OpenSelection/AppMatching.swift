@@ -126,4 +126,18 @@ public enum AppMatching: Sendable {
         guard let bundleID else { return false }
         return strictlyNativeApps.contains(bundleID)
     }
+
+    public static let richDocumentApps: Set<String> = [
+        "com.apple.Notes",
+        "com.apple.TextEdit",
+        "com.apple.iWork.Pages",
+        "com.apple.iWork.Numbers",
+        "com.apple.iWork.Keynote",
+        "com.apple.mail"
+    ]
+
+    public static func isRichDocumentApp(_ bundleID: String?) -> Bool {
+        guard let bundleID else { return false }
+        return richDocumentApps.contains(bundleID)
+    }
 }

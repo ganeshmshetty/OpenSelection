@@ -223,11 +223,15 @@ public struct SelectionRetrievalCoordinator: Sendable {
         guard allowCopyFallback else { return result }
         guard result.html == nil && result.rtf == nil else { return result }
         guard strategy != .keyboardCopy && strategy != .menuCopy && strategy != .officeScript else { return result }
-        let bundleIsBrowser = AppMatching.isBrowser(app.bundleIdentifier)
-        guard bundleIsBrowser || target.webArea != nil || target.role == "AXWebArea" else { return result }
-        OpenSelectionLogging.log("coordinator: text-only web selection; enriching via pasteboard rich capture")
+        guard let bundleID = app.bundleIdentifier, !bundleID.isEmpty else { return result }
+        let bundleIsBrowser = AppMatching.isBrowser(bundleID)
+        let isMultiProcessApp = AppMatching.isMultiProcess(bundleID)
+        let isRichDocumentApp = AppMatching.isRichDocumentApp(bundleID)
+        let hasWebArea = target.webArea != nil || target.role == "AXWebArea" || target.containedInRoles.contains("AXWebArea")
+        guard bundleIsBrowser || isMultiProcessApp || isRichDocumentApp || hasWebArea else { return result }
+        OpenSelectionLogging.log("coordinator: web/electron/rich-document selection; enriching via pasteboard rich capture")
         guard let captured = Self.nonBlank(await run(.keyboardCopy, app: app, target: target)),
-              captured.html != nil || captured.rtf != nil else {
+              captured.html != nil || captured.rtf != nil || captured.text.contains("\n") else {
             return result
         }
         return SelectionResult(
@@ -235,6 +239,7 @@ public struct SelectionRetrievalCoordinator: Sendable {
             bounds: result.bounds ?? captured.bounds,
             html: captured.html,
             rtf: captured.rtf,
+            flavors: captured.flavors,
             sourceApp: result.sourceApp,
             strategy: strategy,
             isEditable: result.isEditable
@@ -339,6 +344,7 @@ public struct SelectionRetrievalCoordinator: Sendable {
                 bounds: target.bounds,
                 html: captured.html,
                 rtf: captured.rtf,
+                flavors: captured.flavors,
                 sourceApp: nil,
                 strategy: strategy,
                 isEditable: false

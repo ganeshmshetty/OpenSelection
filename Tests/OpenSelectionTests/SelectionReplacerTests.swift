@@ -145,4 +145,103 @@ final class SelectionReplacerTests: XCTestCase {
         try await replacer.replace(with: "no app text", in: nil, restorePasteboard: false)
         XCTAssertEqual(testPasteboard.string(forType: .string), "no app text")
     }
+
+    @MainActor
+    func testRichReplacementWritesMultipleTypesAndMatchStyleFlags() async throws {
+        let box = ReplacerTestBox()
+        let replacer = SelectionReplacer(
+            configuration: SelectionConfiguration(pasteboardDeliveryRestoreDelay: 0.01),
+            pasteboard: testPasteboard,
+            directAXReplacer: { _, _ in false },
+            keyPoster: { code, flags in
+                box.postedKeyCode = code
+                box.postedFlags = flags
+            },
+            appActivator: { _ in }
+        )
+
+        try await replacer.replace(
+            with: "Plain Text",
+            html: "<p>Plain Text</p>",
+            rtf: "{\\rtf1 Plain Text}",
+            in: nil,
+            matchStyle: true,
+            restorePasteboard: false
+        )
+
+        XCTAssertEqual(testPasteboard.string(forType: .string), "Plain Text")
+        XCTAssertEqual(testPasteboard.string(forType: .html), "<p>Plain Text</p>")
+        XCTAssertNotNil(testPasteboard.data(forType: .rtf))
+        XCTAssertTrue(box.postedFlags?.contains(.maskAlternate) ?? false)
+        XCTAssertTrue(box.postedFlags?.contains(.maskShift) ?? false)
+        XCTAssertTrue(box.postedFlags?.contains(.maskCommand) ?? false)
+    }
+
+    @MainActor
+    func testRichReplacementPreservesHighBitRTFBytes() async throws {
+        let replacer = SelectionReplacer(
+            configuration: SelectionConfiguration(pasteboardDeliveryRestoreDelay: 0.01),
+            pasteboard: testPasteboard,
+            directAXReplacer: { _, _ in false },
+            keyPoster: { _, _ in },
+            appActivator: { _ in }
+        )
+
+        // ISO Latin-1 bytes that are not valid UTF-8: they must survive the String bridge intact.
+        let rtf = "{\\rtf1 caf\u{00E9}}"
+
+        try await replacer.replace(with: "Plain", rtf: rtf, in: nil, restorePasteboard: false)
+
+        let written = try XCTUnwrap(testPasteboard.data(forType: .rtf))
+        XCTAssertEqual(String(data: written, encoding: .isoLatin1), rtf)
+    }
+
+    @MainActor
+    func testReplacementWritesFlavorsVerbatim() async throws {
+        let replacer = SelectionReplacer(
+            configuration: SelectionConfiguration(pasteboardDeliveryRestoreDelay: 0.01),
+            pasteboard: testPasteboard,
+            directAXReplacer: { _, _ in false },
+            keyPoster: { _, _ in },
+            appActivator: { _ in }
+        )
+        let proprietaryType = NSPasteboard.PasteboardType("com.apple.notes.richtext")
+        let proprietaryData = Data([0x00, 0x01, 0xFE, 0xFF])
+        let flavors = [
+            PasteboardFlavor(type: "public.rtf", data: Data("{\\rtf1 x}".utf8)),
+            PasteboardFlavor(type: proprietaryType.rawValue, data: proprietaryData)
+        ]
+
+        // Plain text is ignored when flavors are supplied: the captured representations are the source of truth.
+        try await replacer.replace(with: "ignored", flavors: flavors, in: nil, restorePasteboard: false)
+
+        XCTAssertEqual(testPasteboard.data(forType: proprietaryType), proprietaryData)
+        XCTAssertEqual(testPasteboard.data(forType: .rtf), Data("{\\rtf1 x}".utf8))
+    }
+
+    @MainActor
+    func testFormattedTextAndMetricsReconstructParagraphsFromHTML() {
+        let singleLineText = "Paragraph 1 Paragraph 2"
+        let html = "<p>Paragraph 1</p><p>Paragraph 2</p>"
+        let result = SelectionResult(text: singleLineText, html: html)
+
+        let formatted = result.formattedText
+        XCTAssertTrue(formatted.contains("\n"), "Formatted text should restore newlines from HTML")
+
+        let metrics = result.metrics
+        XCTAssertGreaterThanOrEqual(metrics.paragraphs, 2, "Should recognize multiple paragraphs from HTML")
+        XCTAssertEqual(metrics.words, 4)
+    }
+
+    @MainActor
+    func testFormattedTextReconstructsParagraphsFromRTFWhenHTMLMissing() {
+        let singleLineText = "Paragraph 1 Paragraph 2"
+        let rtf = "{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0 Helvetica;}}\\f0\\fs24 Paragraph 1\\par Paragraph 2}"
+        let result = SelectionResult(text: singleLineText, rtf: rtf)
+
+        let formatted = result.formattedText
+        XCTAssertNotEqual(formatted, singleLineText, "Formatted text should be reconstructed from RTF")
+        XCTAssertTrue(formatted.contains("\n"), "Formatted text should restore paragraph breaks from RTF")
+        XCTAssertGreaterThanOrEqual(result.metrics.paragraphs, 2)
+    }
 }

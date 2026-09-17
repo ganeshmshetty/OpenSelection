@@ -618,6 +618,28 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
         XCTAssertEqual(result?.html, "<b>rich</b> selection")
     }
 
+    func testRichDocumentAppEnrichesFromPasteboardCapture() async {
+        let coordinator = SelectionRetrievalCoordinator(
+            inspect: { Self.textFieldTarget(selectedText: "flattened notes text") },
+            copyCapture: { _ in
+                SelectionResult(
+                    text: "Paragraph 1\n\nParagraph 2",
+                    rtf: "{\\rtf1\\ansi Paragraph 1\\par Paragraph 2}",
+                    flavors: [PasteboardFlavor(type: "com.apple.notes.richtext", data: Data([0x00, 0x01]))]
+                )
+            }
+        )
+        let policy = AppPolicyContext(retrievalMode: .axTextControl)
+        let result = await coordinator.retrieve(
+            for: AppIdentity(bundleIdentifier: "com.apple.Notes"),
+            policy: policy,
+            cursor: .unknown
+        )
+        XCTAssertEqual(result?.text, "Paragraph 1\n\nParagraph 2")
+        XCTAssertNotNil(result?.rtf, "Rich document apps should retain RTF captured from the pasteboard")
+        XCTAssertEqual(result?.flavors.first?.type, "com.apple.notes.richtext", "Captured flavors must survive enrichment")
+    }
+
     func testNativeAppTextOnlyWinDoesNotFireCopyCapture() async throws {
         final class Counter: @unchecked Sendable { var calls = 0 }
         let counter = Counter()
@@ -629,7 +651,8 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
             }
         )
         let policy = AppPolicyContext(retrievalMode: .axTextControl)
-        let nativeBundleID = try XCTUnwrap(AppMatching.nativeApps.first)
+        // A strictly-native app that is *not* a rich document app (those now enrich from the pasteboard).
+        let nativeBundleID = try XCTUnwrap(AppMatching.nativeApps.first { !AppMatching.isRichDocumentApp($0) })
         let result = await coordinator.retrieve(
             for: AppIdentity(bundleIdentifier: nativeBundleID),
             policy: policy,

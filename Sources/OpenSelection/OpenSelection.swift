@@ -163,7 +163,11 @@ public enum OpenSelection: Sendable {
     @MainActor
     public static func replace(
         with text: String,
+        html: String? = nil,
+        rtf: String? = nil,
+        flavors: [PasteboardFlavor] = [],
         in app: NSRunningApplication? = nil,
+        matchStyle: Bool = false,
         restorePasteboard: Bool = true,
         pasteboard: NSPasteboard = .general,
         configuration: SelectionConfiguration? = nil
@@ -172,17 +176,37 @@ public enum OpenSelection: Sendable {
             configuration: configuration ?? Self.configuration,
             pasteboard: pasteboard
         )
-        try await replacer.replace(with: text, in: app, restorePasteboard: restorePasteboard)
+        try await replacer.replace(
+            with: text,
+            html: html,
+            rtf: rtf,
+            flavors: flavors,
+            in: app,
+            matchStyle: matchStyle,
+            restorePasteboard: restorePasteboard
+        )
     }
 
     /// Replaces the current selection (convenience alias for replace).
     @MainActor
     public static func replaceSelection(
         with text: String,
+        html: String? = nil,
+        rtf: String? = nil,
+        flavors: [PasteboardFlavor] = [],
         in app: NSRunningApplication? = nil,
+        matchStyle: Bool = false,
         restorePasteboard: Bool = true
     ) async throws {
-        try await replace(with: text, in: app, restorePasteboard: restorePasteboard)
+        try await replace(
+            with: text,
+            html: html,
+            rtf: rtf,
+            flavors: flavors,
+            in: app,
+            matchStyle: matchStyle,
+            restorePasteboard: restorePasteboard
+        )
     }
 
     // MARK: - Push Monitoring API
