@@ -93,7 +93,8 @@ public struct SelectionRetrievalCoordinator: Sendable {
         policy: SelectionPolicy = .default,
         cursor: CursorClass = .unknown,
         isSelectAll: Bool = false,
-        allowCopyFallback: Bool = true
+        allowCopyFallback: Bool = true,
+        requireCopyEvidence: Bool = true
     ) async -> (result: SelectionResult?, isEditable: Bool) {
         let target = await inspectWithWatchdog()
         guard let target else {
@@ -126,7 +127,14 @@ public struct SelectionRetrievalCoordinator: Sendable {
 
         OpenSelectionLogging.log("coordinator: gate passed for \(app.bundleIdentifier ?? "unknown"); retrieving via \(policy.retrievalMode.rawValue)")
 
-        let readResult = Self.nonBlank(await read(for: app, target: target, policy: policy, allowCopyFallback: allowCopyFallback))
+        let readResult = Self.nonBlank(await read(
+            for: app,
+            target: target,
+            policy: policy,
+            cursor: cursor,
+            allowCopyFallback: allowCopyFallback,
+            requireCopyEvidence: requireCopyEvidence
+        ))
         return (readResult, isEditable)
     }
 
@@ -136,14 +144,16 @@ public struct SelectionRetrievalCoordinator: Sendable {
         policy: SelectionPolicy = .default,
         cursor: CursorClass = .unknown,
         isSelectAll: Bool = false,
-        allowCopyFallback: Bool = true
+        allowCopyFallback: Bool = true,
+        requireCopyEvidence: Bool = true
     ) async -> (result: SelectionResult?, isEditable: Bool) {
         await retrieveDetails(
             for: AppIdentity(app),
             policy: policy,
             cursor: cursor,
             isSelectAll: isSelectAll,
-            allowCopyFallback: allowCopyFallback
+            allowCopyFallback: allowCopyFallback,
+            requireCopyEvidence: requireCopyEvidence
         )
     }
 
@@ -153,14 +163,16 @@ public struct SelectionRetrievalCoordinator: Sendable {
         policy: SelectionPolicy = .default,
         cursor: CursorClass = .unknown,
         isSelectAll: Bool = false,
-        allowCopyFallback: Bool = true
+        allowCopyFallback: Bool = true,
+        requireCopyEvidence: Bool = true
     ) async -> SelectionResult? {
         await retrieveDetails(
             for: app,
             policy: policy,
             cursor: cursor,
             isSelectAll: isSelectAll,
-            allowCopyFallback: allowCopyFallback
+            allowCopyFallback: allowCopyFallback,
+            requireCopyEvidence: requireCopyEvidence
         ).result
     }
 
@@ -170,14 +182,16 @@ public struct SelectionRetrievalCoordinator: Sendable {
         policy: SelectionPolicy = .default,
         cursor: CursorClass = .unknown,
         isSelectAll: Bool = false,
-        allowCopyFallback: Bool = true
+        allowCopyFallback: Bool = true,
+        requireCopyEvidence: Bool = true
     ) async -> SelectionResult? {
         await retrieve(
             for: AppIdentity(app),
             policy: policy,
             cursor: cursor,
             isSelectAll: isSelectAll,
-            allowCopyFallback: allowCopyFallback
+            allowCopyFallback: allowCopyFallback,
+            requireCopyEvidence: requireCopyEvidence
         )
     }
 
@@ -187,7 +201,9 @@ public struct SelectionRetrievalCoordinator: Sendable {
         for app: AppIdentity,
         target: AXElementInspector.Target,
         policy: SelectionPolicy,
-        allowCopyFallback: Bool = true
+        cursor: CursorClass,
+        allowCopyFallback: Bool = true,
+        requireCopyEvidence: Bool = true
     ) async -> SelectionResult? {
         let bundleID = app.bundleIdentifier ?? "unknown"
         var strategies = strategyCascade(for: policy, target: target, bundleIdentifier: app.bundleIdentifier)
@@ -200,13 +216,27 @@ public struct SelectionRetrievalCoordinator: Sendable {
                 let previous = strategies[index - 1]
                 OpenSelectionLogging.log("coordinator: \(previous.rawValue) produced no text for \(bundleID); falling back to \(strategy.rawValue)")
             }
+            if requireCopyEvidence {
+                if let evidence = Self.copyEvidence(strategy, target: target, cursor: cursor) {
+                    OpenSelectionLogging.log("coordinator: \(strategy.rawValue) permitted for \(bundleID); text-selection evidence=\(evidence)")
+                } else {
+                    OpenSelectionLogging.log("coordinator: skipping \(strategy.rawValue) for \(bundleID); no text-selection evidence (cursor=\(cursor.rawValue))")
+                    continue
+                }
+            }
             if let result = Self.nonBlank(await run(strategy, app: app, target: target)) {
                 if index > 0 {
                     OpenSelectionLogging.log("coordinator: fallback \(strategy.rawValue) succeeded for \(bundleID)")
                 } else {
                     OpenSelectionLogging.log("coordinator: primary \(strategy.rawValue) succeeded for \(bundleID)")
                 }
-                return await enrichRichContent(result, strategy: strategy, app: app, target: target, allowCopyFallback: allowCopyFallback)
+                return await enrichRichContent(
+                    result,
+                    strategy: strategy,
+                    app: app,
+                    target: target,
+                    allowCopyFallback: allowCopyFallback
+                )
             }
         }
         OpenSelectionLogging.log("coordinator: all strategies exhausted for \(bundleID); no selection")
@@ -220,18 +250,27 @@ public struct SelectionRetrievalCoordinator: Sendable {
         target: AXElementInspector.Target,
         allowCopyFallback: Bool = true
     ) async -> SelectionResult {
+        guard configuration.enrichRichContent else { return result }
         guard allowCopyFallback else { return result }
         guard result.html == nil && result.rtf == nil else { return result }
         guard strategy != .keyboardCopy && strategy != .menuCopy && strategy != .officeScript else { return result }
         guard let bundleID = app.bundleIdentifier, !bundleID.isEmpty else { return result }
+        // The winning result is substantial text read from the target app by a non-copy strategy
+        // (copy strategies are excluded above), so a real text selection is already established.
+        // Checking `target` for evidence here would be wrong anyway: the web-area cascade may have
+        // retrieved the text from a fresh settle-retry snapshot, leaving `target` (the original
+        // inspect) stale and evidence-free.
         let bundleIsBrowser = AppMatching.isBrowser(bundleID)
         let isMultiProcessApp = AppMatching.isMultiProcess(bundleID)
         let isRichDocumentApp = AppMatching.isRichDocumentApp(bundleID)
         let hasWebArea = target.webArea != nil || target.role == "AXWebArea" || target.containedInRoles.contains("AXWebArea")
         guard bundleIsBrowser || isMultiProcessApp || isRichDocumentApp || hasWebArea else { return result }
         OpenSelectionLogging.log("coordinator: web/electron/rich-document selection; enriching via pasteboard rich capture")
+        // Keep the capture when it carries anything the AX read cannot express: HTML, RTF,
+        // multi-line text, or app-private pasteboard flavors (e.g. `com.apple.notes.richtext`).
+        // A single-line capture with only flavors must still replace the flavorless AX result.
         guard let captured = Self.nonBlank(await run(.keyboardCopy, app: app, target: target)),
-              captured.html != nil || captured.rtf != nil || captured.text.contains("\n") else {
+              captured.html != nil || captured.rtf != nil || !captured.flavors.isEmpty || captured.text.contains("\n") else {
             return result
         }
         return SelectionResult(
@@ -274,6 +313,16 @@ public struct SelectionRetrievalCoordinator: Sendable {
             return [.menuCopy]
 
         case .keyboardCopy:
+            // Electron/Chromium apps (Discord, Slack, VS Code, Linear…) expose their selection
+            // through AX once accessibility is active. Try those non-destructive reads before
+            // posting a synthetic ⌘C, so the copy is a genuine last resort rather than the
+            // default even when AX can see the selection.
+            if AppMatching.isMultiProcess(bundleIdentifier) {
+                if target.webArea != nil || target.role == "AXWebArea" || target.containedInRoles.contains("AXWebArea") {
+                    return [.axWebArea, .keyboardCopy]
+                }
+                return [.axTextControl, .keyboardCopy]
+            }
             return [.keyboardCopy]
 
         case .officeScript:
@@ -503,6 +552,54 @@ public struct SelectionRetrievalCoordinator: Sendable {
             return true
         }
         return false
+    }
+
+    /// Text-control roles that justify a copy-based read on their own. Deliberately excludes
+    /// `AXWebArea`: an Electron canvas (Figma) lives inside a web area, so counting it as text
+    /// evidence would let a plain object drag through.
+    static let textEvidenceRoles: Set<String> = [
+        "AXTextField",
+        "AXTextArea",
+        "AXSearchField",
+        "AXComboBox"
+    ]
+
+    /// Returns the matching text-selection signal when a copy strategy is justified, else `nil`.
+    ///
+    /// Copy and menu strategies post a real, system-wide side effect (a ⌘C or an Edit ▸ Copy
+    /// press), so they must be justified by positive evidence that text is actually selected.
+    /// Without this, an app classified as copy-based fires ⌘C on every qualifying gesture — e.g.
+    /// dragging a Figma object mutates Figma's selection and undo state instead of reading text.
+    ///
+    /// Evidence is: an I-beam cursor (a text caret under the pointer), `AXSelectedText` with
+    /// content, a resolved `AXStringForTextMarkerRange` with content, a *non-empty*
+    /// `AXSelectedTextRange`, or the focused/ancestor element being a text control.
+    /// `isTextBearing` is intentionally *not* used here: it returns true whenever
+    /// `webArea != nil` or an ancestor is `AXWebArea`.
+    ///
+    /// Two AX signals are deliberately excluded because they are non-nil even without a text
+    /// selection in Electron/web canvases (Figma on its canvas): a collapsed caret exposes an
+    /// `AXSelectedTextRange` with length 0 (so the range must have positive length), and a web
+    /// area exposes a non-nil `AXSelectedTextMarkerRange` regardless — so only a marker range that
+    /// *resolves to text* counts.
+    static func copyEvidence(
+        _ strategy: SelectionStrategy,
+        target: AXElementInspector.Target,
+        cursor: CursorClass
+    ) -> String? {
+        guard strategy == .keyboardCopy || strategy == .menuCopy else { return "not-a-copy-strategy" }
+        if cursor == .beam { return "beam-cursor" }
+        if let selected = target.selectedText, !selected.isEmpty { return "ax-selected-text" }
+        if let markerText = target.selectedMarkerText, !markerText.isEmpty { return "ax-marker-text" }
+        if let range = target.selectedTextRange, CFGetTypeID(range) == AXValueGetTypeID() {
+            var cfRange = CFRange()
+            if AXValueGetValue(range as! AXValue, .cfRange, &cfRange), cfRange.length > 0 {
+                return "ax-selected-text-range(len=\(cfRange.length))"
+            }
+        }
+        if let role = target.role, textEvidenceRoles.contains(role) { return "ax-role:\(role)" }
+        if let role = target.containedInRoles.first(where: textEvidenceRoles.contains) { return "ax-ancestor-role:\(role)" }
+        return nil
     }
 
     private static func nonBlank(_ result: SelectionResult?) -> SelectionResult? {

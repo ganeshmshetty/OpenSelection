@@ -64,6 +64,66 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
         )
     }
 
+    /// A web-area-style target whose only AX selection signal is a non-nil (but opaque)
+    /// `AXSelectedTextMarkerRange`, as Electron/web canvases report with nothing selected.
+    private static func markerRangeTarget() -> AXElementInspector.Target {
+        AXElementInspector.Target(
+            focusedApp: nil,
+            focusedElement: nil,
+            role: "AXWebArea",
+            subRole: nil,
+            parentRoles: ["AXGroup"],
+            containedInRoles: ["AXGroup"],
+            webArea: nil,
+            selectedText: "",
+            selectedTextMarkerRange: NSObject(),
+            value: nil,
+            selectedTextRange: nil,
+            bounds: nil
+        )
+    }
+
+    /// A web-area-style target whose only selection signal is a marker range that resolved to text.
+    private static func markerTextTarget(_ text: String) -> AXElementInspector.Target {
+        AXElementInspector.Target(
+            focusedApp: nil,
+            focusedElement: nil,
+            role: "AXWebArea",
+            subRole: nil,
+            parentRoles: [],
+            containedInRoles: [],
+            webArea: nil,
+            selectedText: "",
+            selectedTextMarkerRange: NSObject(),
+            selectedMarkerText: text,
+            value: nil,
+            selectedTextRange: nil,
+            bounds: nil
+        )
+    }
+
+    /// A target whose only possible evidence is an `AXSelectedTextRange` of `length` code units.
+    /// Length 0 models a collapsed caret (Figma on its canvas); positive length models a real
+    /// text selection.
+    private static func rangeTarget(length: Int) -> AXElementInspector.Target {
+        var cfRange = CFRange(location: 0, length: length)
+        let value = AXValueCreate(.cfRange, &cfRange)
+        return AXElementInspector.Target(
+            focusedApp: nil,
+            focusedElement: nil,
+            role: nil,
+            subRole: nil,
+            parentRoles: [],
+            containedInRoles: [],
+            webArea: nil,
+            selectedText: nil,
+            selectedTextMarkerRange: nil,
+            value: nil,
+            selectedTextRange: value,
+            bounds: nil
+        )
+    }
+
     // MARK: - Gate
 
     func testGateSkipsButtonRole() async {
@@ -298,11 +358,34 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
         )
         let policy = AppPolicyContext(retrievalMode: .keyboardCopy)
         let result = await coordinator.retrieve(
-            for: AppIdentity(bundleIdentifier: "com.microsoft.VSCode"),
+            for: AppIdentity(bundleIdentifier: "com.sublimetext.3"),
             policy: policy,
             cursor: .unknown
         )
         XCTAssertEqual(result?.text, "captured keyboard copy")
+    }
+
+    /// Electron/Chromium apps are copy-classified but should read AX first (non-destructively)
+    /// before posting ⌘C: accessibility usually sees the selection once it is active.
+    func testElectronKeyboardCopyPrefersAXTextOverCopy() async {
+        final class Counter: @unchecked Sendable { var calls = 0 }
+        let counter = Counter()
+        let coordinator = SelectionRetrievalCoordinator(
+            inspect: { Self.textFieldTarget(selectedText: "electron ax text") },
+            copyCapture: { _ in
+                counter.calls += 1
+                return SelectionResult(text: "captured keyboard copy")
+            }
+        )
+        let policy = AppPolicyContext(retrievalMode: .keyboardCopy)
+        let result = await coordinator.retrieve(
+            for: AppIdentity(bundleIdentifier: "com.microsoft.VSCode"),
+            policy: policy,
+            cursor: .unknown,
+            allowCopyFallback: false
+        )
+        XCTAssertEqual(result?.text, "electron ax text")
+        XCTAssertEqual(counter.calls, 0, "AX read must win over the synthetic copy")
     }
 
     func testKeyboardCopyHasNoFallbackBelowIt() async {
@@ -420,7 +503,7 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
         XCTAssertEqual(result?.text, "captured select-all text")
     }
 
-    func testSelectAllProceedsOnAppWithNoRecognizableAXRole() async {
+    func testSelectAllProceedsOnOpaqueRoleWithBeamCursor() async {
         let coordinator = SelectionRetrievalCoordinator(
             inspect: { Self.opaqueTarget() },
             copyCapture: { _ in SelectionResult(text: "captured select-all text") }
@@ -429,10 +512,166 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
         let result = await coordinator.retrieve(
             for: AppIdentity(bundleIdentifier: "dev.zed.Zed"),
             policy: policy,
-            cursor: .unknown,
+            cursor: .beam,
             isSelectAll: true
         )
         XCTAssertEqual(result?.text, "captured select-all text")
+    }
+
+    // MARK: - Copy evidence gate
+
+    func testCopySkippedOnCanvasDragWithoutTextEvidence() async {
+        final class Counter: @unchecked Sendable { var calls = 0 }
+        let counter = Counter()
+        let coordinator = SelectionRetrievalCoordinator(
+            inspect: { Self.opaqueTarget(containedInRoles: ["AXWebArea"]) },
+            copyCapture: { _ in
+                counter.calls += 1
+                return SelectionResult(text: "copied object")
+            }
+        )
+        let policy = AppPolicyContext(retrievalMode: .keyboardCopy)
+        let result = await coordinator.retrieve(
+            for: AppIdentity(bundleIdentifier: "com.figma.Desktop"),
+            policy: policy,
+            cursor: .arrow
+        )
+        XCTAssertNil(result)
+        XCTAssertEqual(counter.calls, 0, "A canvas drag must never post a synthetic ⌘C")
+    }
+
+    func testCopyProceedsWithBeamCursorTextEvidence() async {
+        let coordinator = SelectionRetrievalCoordinator(
+            inspect: { Self.opaqueTarget() },
+            copyCapture: { _ in SelectionResult(text: "captured via keyboard copy") }
+        )
+        let policy = AppPolicyContext(retrievalMode: .keyboardCopy)
+        let result = await coordinator.retrieve(
+            for: AppIdentity(bundleIdentifier: "com.figma.Desktop"),
+            policy: policy,
+            cursor: .beam
+        )
+        XCTAssertEqual(result?.text, "captured via keyboard copy")
+    }
+
+    func testCopySkippedForAXWebAreaAncestorWithoutSelection() async {
+        final class Counter: @unchecked Sendable { var calls = 0 }
+        let counter = Counter()
+        let coordinator = SelectionRetrievalCoordinator(
+            inspect: { Self.opaqueTarget(containedInRoles: ["AXWebArea", "AXGroup"]) },
+            copyCapture: { _ in
+                counter.calls += 1
+                return SelectionResult(text: "copied object")
+            }
+        )
+        let policy = AppPolicyContext(retrievalMode: .keyboardCopy)
+        let result = await coordinator.retrieve(
+            for: AppIdentity(bundleIdentifier: "com.figma.Desktop"),
+            policy: policy,
+            cursor: .pointingHand
+        )
+        XCTAssertNil(result)
+        XCTAssertEqual(counter.calls, 0, "AXWebArea ancestry alone is not text evidence")
+    }
+
+    func testCopyEvidenceGateCanBeDisabledForExplicitTriggers() async {
+        let coordinator = SelectionRetrievalCoordinator(
+            inspect: { Self.opaqueTarget(containedInRoles: ["AXWebArea"]) },
+            copyCapture: { _ in SelectionResult(text: "explicit hotkey capture") }
+        )
+        let policy = AppPolicyContext(retrievalMode: .keyboardCopy)
+        let result = await coordinator.retrieve(
+            for: AppIdentity(bundleIdentifier: "com.figma.Desktop"),
+            policy: policy,
+            cursor: .arrow,
+            requireCopyEvidence: false
+        )
+        XCTAssertEqual(result?.text, "explicit hotkey capture")
+    }
+
+    func testCollapsedCaretRangeIsNotTextEvidence() async {
+        final class Counter: @unchecked Sendable { var calls = 0 }
+        let counter = Counter()
+        let coordinator = SelectionRetrievalCoordinator(
+            inspect: { Self.rangeTarget(length: 0) },
+            copyCapture: { _ in
+                counter.calls += 1
+                return SelectionResult(text: "should not copy")
+            }
+        )
+        let result = await coordinator.retrieve(
+            for: AppIdentity(bundleIdentifier: "com.figma.Desktop"),
+            policy: AppPolicyContext(retrievalMode: .keyboardCopy),
+            cursor: .arrow
+        )
+        XCTAssertNil(result)
+        XCTAssertEqual(counter.calls, 0, "A zero-length caret range must not justify ⌘C")
+    }
+
+    func testNonEmptyRangeIsTextEvidence() async {
+        let coordinator = SelectionRetrievalCoordinator(
+            inspect: { Self.rangeTarget(length: 5) },
+            copyCapture: { _ in SelectionResult(text: "copied") }
+        )
+        let result = await coordinator.retrieve(
+            for: AppIdentity(bundleIdentifier: "com.figma.Desktop"),
+            policy: AppPolicyContext(retrievalMode: .keyboardCopy),
+            cursor: .arrow
+        )
+        XCTAssertEqual(result?.text, "copied")
+    }
+
+    func testMarkerRangeAloneIsNotTextEvidence() async {
+        final class Counter: @unchecked Sendable { var calls = 0 }
+        let counter = Counter()
+        let coordinator = SelectionRetrievalCoordinator(
+            inspect: { Self.markerRangeTarget() },
+            copyCapture: { _ in
+                counter.calls += 1
+                return SelectionResult(text: "should not copy")
+            }
+        )
+        let result = await coordinator.retrieve(
+            for: AppIdentity(bundleIdentifier: "com.figma.Desktop"),
+            policy: AppPolicyContext(retrievalMode: .keyboardCopy),
+            cursor: .arrow
+        )
+        XCTAssertNil(result)
+        XCTAssertEqual(counter.calls, 0, "A marker range alone must not justify ⌘C")
+    }
+
+    /// Figma's canvas reports `cursor = .unknown` (a custom move cursor) alongside an empty marker
+    /// range. `.unknown` must NOT count as copy evidence, or an object drag would post ⌘C again.
+    func testUnknownCursorOnCanvasIsNotTextEvidence() async {
+        final class Counter: @unchecked Sendable { var calls = 0 }
+        let counter = Counter()
+        let coordinator = SelectionRetrievalCoordinator(
+            inspect: { Self.markerRangeTarget() },
+            copyCapture: { _ in
+                counter.calls += 1
+                return SelectionResult(text: "should not copy")
+            }
+        )
+        let result = await coordinator.retrieve(
+            for: AppIdentity(bundleIdentifier: "com.figma.Desktop"),
+            policy: AppPolicyContext(retrievalMode: .keyboardCopy),
+            cursor: .unknown
+        )
+        XCTAssertNil(result)
+        XCTAssertEqual(counter.calls, 0, ".unknown cursor must not justify ⌘C on a canvas")
+    }
+
+    func testMarkerTextIsTextEvidence() async {
+        let coordinator = SelectionRetrievalCoordinator(
+            inspect: { Self.markerTextTarget("resolved web text") },
+            copyCapture: { _ in SelectionResult(text: "copied") }
+        )
+        let result = await coordinator.retrieve(
+            for: AppIdentity(bundleIdentifier: "com.hnc.Discord"),
+            policy: AppPolicyContext(retrievalMode: .keyboardCopy),
+            cursor: .arrow
+        )
+        XCTAssertEqual(result?.text, "copied")
     }
 
     func testSelectAllSkippedInsideRowContainer() async {
@@ -697,6 +936,66 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
         )
         XCTAssertEqual(result?.text, "plain selection")
         XCTAssertNil(result?.html)
+    }
+
+    /// Regression: a web area that only exposes its selection after a settle retry must still be
+    /// enriched. The copy-evidence check used the original inspect snapshot, which a later retry
+    /// had replaced — so a real selection looked evidence-free and enrichment was skipped.
+    func testSettledWebAreaRetryStillEnrichesRichContent() async {
+        final class SnapshotSequence: @unchecked Sendable {
+            private let lock = NSLock()
+            private var calls = 0
+            private let first: AXElementInspector.Target
+            private let settled: AXElementInspector.Target
+            init(first: AXElementInspector.Target, settled: AXElementInspector.Target) {
+                self.first = first
+                self.settled = settled
+            }
+            func next() -> AXElementInspector.Target {
+                lock.lock()
+                defer { lock.unlock() }
+                calls += 1
+                return calls == 1 ? first : settled
+            }
+        }
+        let sequence = SnapshotSequence(
+            first: Self.markerRangeTarget(),
+            settled: Self.webAreaTarget(selectedText: "settled web text")
+        )
+        let coordinator = SelectionRetrievalCoordinator(
+            inspect: { sequence.next() },
+            copyCapture: { _ in SelectionResult(text: "rich settled", html: "<b>rich settled</b>") }
+        )
+        let policy = AppPolicyContext(retrievalMode: .axWebArea)
+        let result = await coordinator.retrieve(
+            for: AppIdentity(bundleIdentifier: "com.google.Chrome"),
+            policy: policy,
+            cursor: .arrow
+        )
+        XCTAssertEqual(result?.text, "rich settled")
+        XCTAssertEqual(result?.html, "<b>rich settled</b>")
+    }
+
+    /// Regression: an app-private pasteboard flavor captured by a single-line copy must survive
+    /// enrichment even when no HTML/RTF was written. Dropping it silently lost app-private data.
+    func testFlavorOnlyPasteboardCaptureIsRetained() async {
+        let coordinator = SelectionRetrievalCoordinator(
+            inspect: { Self.webAreaTarget(selectedText: "plain web selection") },
+            copyCapture: { _ in
+                SelectionResult(
+                    text: "plain web selection",
+                    flavors: [PasteboardFlavor(type: "com.example.private", data: Data([0x01, 0x02]))]
+                )
+            }
+        )
+        let policy = AppPolicyContext(retrievalMode: .axWebArea)
+        let result = await coordinator.retrieve(
+            for: AppIdentity(bundleIdentifier: "com.google.Chrome"),
+            policy: policy,
+            cursor: .unknown
+        )
+        XCTAssertEqual(result?.text, "plain web selection")
+        XCTAssertEqual(result?.flavors.first?.type, "com.example.private")
     }
 
     // MARK: - Inspect concurrency gate

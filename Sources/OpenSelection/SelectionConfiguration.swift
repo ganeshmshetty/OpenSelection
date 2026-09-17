@@ -48,6 +48,12 @@ public struct SelectionConfiguration: Sendable, Equatable {
     /// Maximum concurrent paste probes allowed.
     public var pasteProbeMaxConcurrent: Int
 
+    /// Whether web / Electron / rich-document selections are enriched by posting a synthetic copy
+    /// to capture HTML, RTF, and app-private pasteboard flavors. Disabling it removes that
+    /// keystroke (and the clipboard churn, and any site anti-copy handler it trips) at the cost of
+    /// rich content.
+    public var enrichRichContent: Bool
+
     /// Default excluded bundle IDs (e.g. password managers, security utilities).
     public static let defaultExcludedBundleIDs: Set<String> = [
         "com.1password.1password",
@@ -70,7 +76,8 @@ public struct SelectionConfiguration: Sendable, Equatable {
         pasteboardDeliveryRestoreDelay: TimeInterval = 0.25,
         pasteVirtualKey: CGKeyCode = 0x09,
         pasteProbeTimeout: TimeInterval = 0.2,
-        pasteProbeMaxConcurrent: Int = 4
+        pasteProbeMaxConcurrent: Int = 4,
+        enrichRichContent: Bool = true
     ) {
         self.axReadTimeout = axReadTimeout
         self.axMaxConcurrentInspects = axMaxConcurrentInspects
@@ -86,7 +93,16 @@ public struct SelectionConfiguration: Sendable, Equatable {
         self.pasteVirtualKey = pasteVirtualKey
         self.pasteProbeTimeout = pasteProbeTimeout
         self.pasteProbeMaxConcurrent = pasteProbeMaxConcurrent
+        self.enrichRichContent = enrichRichContent
     }
 
-    public static let `default` = SelectionConfiguration()
+    public static let `default`: SelectionConfiguration = {
+        var config = SelectionConfiguration()
+        // Diagnostic / opt-out override: set OPENCLIP_DISABLE_RICH_CAPTURE=1 to skip the
+        // synthetic copy that captures HTML/RTF/flavors for web selections.
+        if ProcessInfo.processInfo.environment["OPENCLIP_DISABLE_RICH_CAPTURE"] == "1" {
+            config.enrichRichContent = false
+        }
+        return config
+    }()
 }

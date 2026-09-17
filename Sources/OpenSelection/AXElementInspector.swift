@@ -25,6 +25,11 @@ public struct AXElementInspector {
         public let webArea: AXUIElement?
         public let selectedText: String?
         public let selectedTextMarkerRange: AnyObject?
+        /// `AXStringForTextMarkerRange` for `selectedTextMarkerRange`, resolved at inspect time.
+        /// A non-nil range whose string is empty/absent is not a real text selection (Figma's
+        /// canvas reports a marker range with no text); a non-empty string is strong, cursor-
+        /// independent evidence of selected text in web/Electron content.
+        public let selectedMarkerText: String?
         public let value: String?
         public let selectedTextRange: AnyObject?
         public let bounds: CGRect?
@@ -39,6 +44,7 @@ public struct AXElementInspector {
             webArea: AXUIElement? = nil,
             selectedText: String? = nil,
             selectedTextMarkerRange: AnyObject? = nil,
+            selectedMarkerText: String? = nil,
             value: String? = nil,
             selectedTextRange: AnyObject? = nil,
             bounds: CGRect? = nil
@@ -52,6 +58,7 @@ public struct AXElementInspector {
             self.webArea = webArea
             self.selectedText = selectedText
             self.selectedTextMarkerRange = selectedTextMarkerRange
+            self.selectedMarkerText = selectedMarkerText
             self.value = value
             self.selectedTextRange = selectedTextRange
             self.bounds = bounds
@@ -67,6 +74,9 @@ public struct AXElementInspector {
 
     /// Canonical AX attribute string for a web area's selected text marker range.
     public static let selectedTextMarkerRangeAttribute = "AXSelectedTextMarkerRange"
+
+    /// Canonical AX attribute string resolving a marker range to its text.
+    private static let stringForTextMarkerRangeAttribute = "AXStringForTextMarkerRange"
 
     /// Resolve the focused application FIRST, then its focused UI element — fresh every call.
     ///
@@ -122,7 +132,21 @@ public struct AXElementInspector {
 
         // Text/value attributes and selection bounds, where supported.
         let selectedText = focusedElement.flatMap { read($0, kAXSelectedTextAttribute) as? String }
-        let selectedTextMarkerRange = selectedTextMarkerRange(focusedElement: focusedElement, webArea: webArea)
+        // Resolve the selected marker range together with the element that owns it, so the
+        // parameterized string query is never issued against a foreign element: Chromium reacts to
+        // an `AXSelectedTextMarkerRange` asked of the wrong element, which can collapse the
+        // page's selection. `AXStringForTextMarkerRange` is therefore always run on the same
+        // element the range was read from.
+        let marker: (owner: AXUIElement, range: AnyObject)?
+        if let focusedElement, let range = read(focusedElement, selectedTextMarkerRangeAttribute) {
+            marker = (focusedElement, range)
+        } else if let webArea, let range = read(webArea, selectedTextMarkerRangeAttribute) {
+            marker = (webArea, range)
+        } else {
+            marker = nil
+        }
+        let selectedTextMarkerRange = marker?.range
+        let selectedMarkerText = marker.flatMap { markerText(for: $0.owner, markerRange: $0.range) }
         let value = focusedElement.flatMap { read($0, kAXValueAttribute) as? String }
         let selectedTextRange = focusedElement.flatMap { read($0, kAXSelectedTextRangeAttribute) }
         let bounds = bounds(for: focusedElement, range: selectedTextRange)
@@ -137,6 +161,7 @@ public struct AXElementInspector {
             webArea: webArea,
             selectedText: selectedText,
             selectedTextMarkerRange: selectedTextMarkerRange,
+            selectedMarkerText: selectedMarkerText,
             value: value,
             selectedTextRange: selectedTextRange,
             bounds: bounds
@@ -150,6 +175,20 @@ public struct AXElementInspector {
         read: (AXUIElement, String) -> CFTypeRef? = { read($0, $1) }
     ) -> AnyObject? {
         focusedElement.flatMap { read($0, selectedTextMarkerRangeAttribute) } ?? webArea.flatMap { read($0, selectedTextMarkerRangeAttribute) }
+    }
+
+    /// Resolves an `AXSelectedTextMarkerRange` to its text via `AXStringForTextMarkerRange`.
+    ///
+    /// Returns `nil` unless `markerRange` really is an `AXTextMarkerRange` on `element` and the
+    /// parameterized query succeeds. A marker range with no text resolves to `nil`/empty — the
+    /// distinction that keeps a web canvas (Figma) from looking like a text selection.
+    public static func markerText(for element: AXUIElement?, markerRange: AnyObject?) -> String? {
+        guard let element, let markerRange, CFGetTypeID(markerRange) == AXTextMarkerRangeGetTypeID() else { return nil }
+        var value: CFTypeRef?
+        guard AXUIElementCopyParameterizedAttributeValue(
+            element, stringForTextMarkerRangeAttribute as CFString, markerRange as! AXTextMarkerRange, &value
+        ) == .success else { return nil }
+        return (value as? String).flatMap { $0.isEmpty ? nil : $0 }
     }
 
     /// Bounded depth-first search for a descendant UI element matching `role`.
