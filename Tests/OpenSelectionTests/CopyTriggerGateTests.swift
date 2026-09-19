@@ -11,8 +11,8 @@ final class CopyTriggerGateTests: XCTestCase {
     /// and would swallow the synthetic ⌘C, so the copy must be suppressed.
     func testForeignFullScreenElevatedOverlaySuppresses() {
         let windows = [
-            OnScreenWindowInfo(ownerPID: 999, layer: 257, frame: display),
-            OnScreenWindowInfo(ownerPID: frontmost, layer: 0, frame: display)
+            OnScreenWindowInfo(ownerPID: 999, ownerBundleID: "com.macshot.app", layer: 257, frame: display),
+            OnScreenWindowInfo(ownerPID: frontmost, ownerBundleID: "com.apple.Safari", layer: 0, frame: display)
         ]
         XCTAssertTrue(CopyTriggerGate.isForeignOverlay(
             windows: windows, at: CGPoint(x: 500, y: 400),
@@ -69,9 +69,35 @@ final class CopyTriggerGateTests: XCTestCase {
     /// CleanShot X activates itself while its picker is up, so `ownerPID == frontmostPID`; the
     /// overlay is recognised structurally as an elevated, display-covering window.
     func testFrontmostFullScreenElevatedWindowIsOverlay() {
-        let overlay = OnScreenWindowInfo(ownerPID: frontmost, layer: 103, frame: display)
+        let overlay = OnScreenWindowInfo(ownerPID: frontmost, ownerBundleID: "com.cleanshot.app", layer: 103, frame: display)
         XCTAssertTrue(CopyTriggerGate.isForeignOverlay(
             windows: [overlay], at: CGPoint(x: 700, y: 400),
+            frontmostPID: frontmost, selfPID: selfPID, displayBounds: display))
+    }
+
+    /// Regression (#104): on macOS 26 with the Dock visible, the Dock owns a full-screen layer-20
+    /// window that covers the display. It never owns an app's key window, so it must not be mistaken
+    /// for a capture overlay — doing so stripped the copy fallback and killed every selection in
+    /// apps that can only be read via copy.
+    func testDockFullScreenChromeDoesNotSuppress() {
+        let windows = [
+            OnScreenWindowInfo(ownerPID: 999, ownerBundleID: "com.apple.dock", layer: 20, frame: display),
+            OnScreenWindowInfo(ownerPID: frontmost, ownerBundleID: "com.apple.Safari", layer: 0, frame: display)
+        ]
+        XCTAssertFalse(CopyTriggerGate.isForeignOverlay(
+            windows: windows, at: CGPoint(x: 500, y: 400),
+            frontmostPID: frontmost, selfPID: selfPID, displayBounds: display))
+    }
+
+    /// The window server owns the menu bar (and other chrome) with no owning application; a
+    /// display-covering window server window is not an app overlay either.
+    func testWindowServerChromeDoesNotSuppress() {
+        let windows = [
+            OnScreenWindowInfo(ownerPID: 1, ownerBundleID: nil, layer: 24, frame: display),
+            OnScreenWindowInfo(ownerPID: frontmost, ownerBundleID: "com.apple.Safari", layer: 0, frame: display)
+        ]
+        XCTAssertFalse(CopyTriggerGate.isForeignOverlay(
+            windows: windows, at: CGPoint(x: 500, y: 400),
             frontmostPID: frontmost, selfPID: selfPID, displayBounds: display))
     }
 

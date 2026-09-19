@@ -14,25 +14,48 @@ import CoreGraphics
 /// coordinates (bottom-left origin) so it can be tested against `NSEvent.mouseLocation`.
 public struct OnScreenWindowInfo: Equatable, Sendable {
     public let ownerPID: pid_t
+    /// The owning application's bundle identifier, or `nil` when no application owns the window
+    /// (the window server). Distinguishes app overlays from system chrome that never receives input.
+    public let ownerBundleID: String?
     public let layer: Int
     public let frame: CGRect
 
-    public init(ownerPID: pid_t, layer: Int, frame: CGRect) {
+    public init(ownerPID: pid_t, ownerBundleID: String? = nil, layer: Int, frame: CGRect) {
         self.ownerPID = ownerPID
+        self.ownerBundleID = ownerBundleID
         self.layer = layer
         self.frame = frame
     }
 }
 
 public enum CopyTriggerGate {
+    /// Bundle identifiers of system chrome — always-present windows that sit above app windows and
+    /// can cover a display, but never own an app's key window, so a synthetic ⌘C is never delivered
+    /// to them. The Dock's full-screen window (layer 20) is the canonical case: on macOS 26 with the
+    /// Dock visible it covers the display and was mistaken for a capture overlay, stripping every
+    /// copy-based read.
+    public static let systemChromeBundleIDs: Set<String> = [
+        "com.apple.dock",
+        "com.apple.wallpaper"
+    ]
+
+    /// Whether `window` can own the key window that receives a synthetic ⌘C. Windows with no owning
+    /// application (the window server) and system chrome cannot, so they must never be treated as
+    /// copy-swallowing overlays.
+    static func canOwnKeyWindow(_ window: OnScreenWindowInfo) -> Bool {
+        guard let bundleID = window.ownerBundleID else { return false }
+        return !systemChromeBundleIDs.contains(bundleID)
+    }
+
     /// Pure decision over a front-to-back window list. Unknown inputs never suppress (fail open).
     ///
     /// The only window that can swallow the synthetic ⌘C is one that owns the key window: an
     /// *elevated* window that *covers the display* — the profile of a capture/annotation tool's
     /// full-screen picker, whether it belongs to another app or activates itself (CleanShot X).
     /// Windows that merely float above the point at a smaller size — a notch/HUD app's panel
-    /// (NotchNook), the Dock, a menu, a tooltip, an Electron helper window — never receive the
-    /// copy, and treating them as overlays silently dropped legitimate selections.
+    /// (NotchNook), a menu, a tooltip, an Electron helper window — never receive the copy, and
+    /// treating them as overlays silently dropped legitimate selections. System chrome (the Dock,
+    /// the window server) is likewise excluded by `canOwnKeyWindow`.
     public static func isForeignOverlay(
         windows: [OnScreenWindowInfo],
         at point: CGPoint,
@@ -42,7 +65,10 @@ public enum CopyTriggerGate {
     ) -> Bool {
         // Without a known frontmost app or display there is nothing to reason about: fail open.
         guard frontmostPID != nil, let displayBounds else { return false }
-        guard let top = windows.first(where: { $0.layer >= 0 && $0.frame.contains(point) }) else { return false }
+        // Only windows that can own the key window are candidates; system chrome is skipped.
+        guard let top = windows.first(where: {
+            $0.layer >= 0 && $0.frame.contains(point) && Self.canOwnKeyWindow($0)
+        }) else { return false }
         if top.ownerPID == selfPID { return false }   // our own popup is not a foreign overlay
         let coversDisplay = top.frame.width >= displayBounds.width - 1
             && top.frame.height >= displayBounds.height - 1
@@ -98,7 +124,14 @@ public enum CopyTriggerGate {
                 width: cgBounds.width,
                 height: cgBounds.height
             )
-            return OnScreenWindowInfo(ownerPID: ownerNumber.int32Value, layer: layerNumber.intValue, frame: cocoaFrame)
+            let ownerPID = ownerNumber.int32Value
+            let ownerBundleID = NSRunningApplication(processIdentifier: ownerPID)?.bundleIdentifier
+            return OnScreenWindowInfo(
+                ownerPID: ownerPID,
+                ownerBundleID: ownerBundleID,
+                layer: layerNumber.intValue,
+                frame: cocoaFrame
+            )
         }
     }
 }
