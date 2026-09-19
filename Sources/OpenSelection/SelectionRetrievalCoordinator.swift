@@ -414,7 +414,21 @@ public struct SelectionRetrievalCoordinator: Sendable {
         case "com.microsoft.Excel":
             return "tell application id \"com.microsoft.Excel\" to if (count of workbooks) > 0 then return string value of selection"
         case "com.microsoft.Powerpoint":
-            return "tell application id \"com.microsoft.Powerpoint\" to if (count of presentations) > 0 then return content of text range of selection"
+            // PowerPoint's app-level `selection` does not resolve to the document window's
+            // selection, so `text range of selection` throws -1728. The working reference is
+            // `selection of active window`; the type guard returns empty instead of throwing when
+            // a shape or slide (rather than text) is selected.
+            return """
+            tell application id "com.microsoft.Powerpoint"
+                if (count of presentations) = 0 then return ""
+                try
+                    if (selection type of selection of active window) is selection type text then
+                        return content of text range of selection of active window
+                    end if
+                end try
+                return ""
+            end tell
+            """
         default:
             return nil
         }
