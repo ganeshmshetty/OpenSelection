@@ -305,6 +305,31 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
         XCTAssertFalse(invoked, "copyCapture must not be invoked when allowCopyFallback is false")
     }
 
+    /// A copy-only app must not be left with an empty cascade when the overlay gate disallows the
+    /// synthetic copy: it degrades to the (event-free) AX reads instead of returning nil, so the
+    /// popup still appears. Regression: the Dock's always-on window tripped the gate and stripped
+    /// the only strategy.
+    func testKeyboardCopyOnlyAppDegradesToAXWhenCopyFallbackDisallowed() async {
+        let tracker = CopyCallTracker()
+        let coordinator = SelectionRetrievalCoordinator(
+            inspect: { Self.textFieldTarget(selectedText: "ax fallback text") },
+            copyCapture: { _ in
+                await tracker.recordCopy()
+                return SelectionResult(text: "should not be called")
+            }
+        )
+        let policy = AppPolicyContext(retrievalMode: .keyboardCopy)
+        let result = await coordinator.retrieve(
+            for: AppIdentity(bundleIdentifier: "abnerworks.Typora"),
+            policy: policy,
+            cursor: .unknown,
+            allowCopyFallback: false
+        )
+        XCTAssertEqual(result?.text, "ax fallback text")
+        let invoked = await tracker.copyInvoked
+        XCTAssertFalse(invoked, "the AX-only degradation must not post a synthetic copy")
+    }
+
     func testRetrieveDetailsIdentifiesEditableTextControl() async {
         let coordinator = SelectionRetrievalCoordinator(
             inspect: { Self.textFieldTarget(selectedText: nil, role: "AXTextField") },

@@ -208,7 +208,18 @@ public struct SelectionRetrievalCoordinator: Sendable {
         let bundleID = app.bundleIdentifier ?? "unknown"
         var strategies = strategyCascade(for: policy, target: target, bundleIdentifier: app.bundleIdentifier)
         if !allowCopyFallback {
-            strategies.removeAll { $0 == .keyboardCopy || $0 == .menuCopy }
+            let nonCopy = strategies.filter { $0 != .keyboardCopy && $0 != .menuCopy }
+            if nonCopy.isEmpty {
+                // The overlay gate forbids the synthetic ⌘C, not reading. An app whose cascade is
+                // copy-only (Typora, CotEditor) would otherwise be left with nothing to try and
+                // return nil, so the popup never appears while any overlay is up. The AX strategies
+                // post no events, so degrading to them keeps the gate's promise and can still read
+                // the selection (Electron/web views expose it via AXWebArea).
+                strategies = [.axTextControl, .axWebArea]
+                OpenSelectionLogging.log("coordinator: overlay gate — skipping copy strategies for \(bundleID); trying AX-only")
+            } else {
+                strategies = nonCopy
+            }
         }
 
         for (index, strategy) in strategies.enumerated() {
