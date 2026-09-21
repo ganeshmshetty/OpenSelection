@@ -63,6 +63,26 @@ final class AXElementInspectorTests: XCTestCase {
         XCTAssertEqual(AXElementInspector.ancestorWalkDepth, 25)
     }
 
+    func testWindowWebAreaSearchSkippedWhenFocusIsNativeTextControl() {
+        // Apple Notes: focus is an AXTextArea outside any web area. Searching its window overran
+        // the inspect deadline, so the popup never appeared.
+        for role in ["AXTextArea", "AXTextField", "AXSearchField", "AXComboBox"] {
+            XCTAssertFalse(AXElementInspector.shouldSearchWindowForWebArea(focusedRole: role, webArea: nil), role)
+        }
+    }
+
+    func testWindowWebAreaSearchRunsWhenFocusIsAtContainerLevel() {
+        // Static page text selected in a browser leaves focus on the window/a group.
+        XCTAssertTrue(AXElementInspector.shouldSearchWindowForWebArea(focusedRole: "AXWindow", webArea: nil))
+        XCTAssertTrue(AXElementInspector.shouldSearchWindowForWebArea(focusedRole: "AXGroup", webArea: nil))
+        XCTAssertTrue(AXElementInspector.shouldSearchWindowForWebArea(focusedRole: nil, webArea: nil))
+    }
+
+    func testWindowWebAreaSearchSkippedWhenWebAreaAlreadyResolved() {
+        let webArea = AXUIElementCreateApplication(500)
+        XCTAssertFalse(AXElementInspector.shouldSearchWindowForWebArea(focusedRole: "AXGroup", webArea: webArea))
+    }
+
     func testFindFirstChildFindsNestedRole() {
         let child = AXUIElementCreateApplication(300)
         let parent = AXUIElementCreateApplication(400)

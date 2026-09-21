@@ -125,7 +125,7 @@ public struct AXElementInspector {
 
         // Fallback: If focusedElement was not inside an AXWebArea (e.g. user selected static text on a page
         // so focus remained at the window or outer container level), search the focused window for the active AXWebArea.
-        if webArea == nil, let app = focusedApp,
+        if shouldSearchWindowForWebArea(focusedRole: role, webArea: webArea), let app = focusedApp,
            let window = read(app, kAXFocusedWindowAttribute).flatMap({ axElement($0) }) {
             webArea = findFirstChild(role: webAreaRole, in: window, maxDepth: 6)
         }
@@ -166,6 +166,18 @@ public struct AXElementInspector {
             selectedTextRange: selectedTextRange,
             bounds: bounds
         )
+    }
+
+    /// Whether `inspect()` should run the window-wide web-area search.
+    ///
+    /// Only when focus sits at a window/container level. A focused native text control already
+    /// exposes its own selection, and the search is expensive in apps with large AX trees: Apple
+    /// Notes walks its folder sidebar and note list (~420 AX calls, 0.6–1.1 s), overrunning the
+    /// inspect deadline so no selection is ever read.
+    static func shouldSearchWindowForWebArea(focusedRole: String?, webArea: AXUIElement?) -> Bool {
+        guard webArea == nil else { return false }
+        guard let focusedRole else { return true }
+        return !SelectionRetrievalCoordinator.textEvidenceRoles.contains(focusedRole)
     }
 
     /// Reads `AXSelectedTextMarkerRange` attribute from `focusedElement`, falling back to `webArea` if `focusedElement` is nil or yields no marker range.
