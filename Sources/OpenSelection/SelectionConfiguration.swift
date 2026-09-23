@@ -77,7 +77,7 @@ public struct SelectionConfiguration: Sendable, Equatable {
         pasteVirtualKey: CGKeyCode = 0x09,
         pasteProbeTimeout: TimeInterval = 0.2,
         pasteProbeMaxConcurrent: Int = 4,
-        enrichRichContent: Bool = true
+        enrichRichContent: Bool = false
     ) {
         self.axReadTimeout = axReadTimeout
         self.axMaxConcurrentInspects = axMaxConcurrentInspects
@@ -98,8 +98,11 @@ public struct SelectionConfiguration: Sendable, Equatable {
 
     public static let `default`: SelectionConfiguration = {
         var config = SelectionConfiguration()
-        // Diagnostic / opt-out override: set OPENCLIP_DISABLE_RICH_CAPTURE=1 to skip the
+        // Diagnostic override: set OPENCLIP_ENABLE_RICH_CAPTURE=1 to enable the
         // synthetic copy that captures HTML/RTF/flavors for web selections.
+        if ProcessInfo.processInfo.environment["OPENCLIP_ENABLE_RICH_CAPTURE"] == "1" {
+            config.enrichRichContent = true
+        }
         if ProcessInfo.processInfo.environment["OPENCLIP_DISABLE_RICH_CAPTURE"] == "1" {
             config.enrichRichContent = false
         }

@@ -6,13 +6,17 @@
 import Foundation
 
 public enum AppMatching: Sendable {
-    /// Wildcard-aware bundle-id match: exact equality, or a trailing-`.*` prefix rule
+    /// Wildcard-aware bundle-id match: exact equality, or a trailing-`.*` / `*` prefix rule
     public static func matches(pattern: String, bundleID: String) -> Bool {
         if pattern == "*" { return true }
         if pattern == bundleID { return true }
         if pattern.hasSuffix(".*") {
             let prefix = String(pattern.dropLast(2))
             return bundleID == prefix || bundleID.hasPrefix(prefix + ".")
+        }
+        if pattern.hasSuffix("*") {
+            let prefix = String(pattern.dropLast(1))
+            return bundleID.hasPrefix(prefix)
         }
         return false
     }
@@ -79,7 +83,11 @@ public enum AppMatching: Sendable {
         "com.github.GitHubClient",
         "org.whispersystems.signal-desktop",
         "com.mattermost.Mattermost",
-        "com.todesktop.*"
+        "com.todesktop.*",
+        "net.whatsapp.WhatsApp*",
+        "com.spotify.client",
+        "com.microsoft.teams*",
+        "com.insomnia.app"
     ]
 
     public static let browserPatterns: [String] = safariGroup + chromiumGroup + firefoxGroup + arcGroup

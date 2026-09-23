@@ -71,13 +71,42 @@ public struct SelectionRetrievalCoordinator: Sendable {
                 if let errorInfo {
                     let message = (errorInfo[NSAppleScript.errorMessage] as? String) ?? "AppleScript error"
                     continuation.resume(throwing: NSError(domain: "OpenSelection.AppleScript", code: 1, userInfo: [NSLocalizedDescriptionKey: message]))
-                } else if let stringValue = descriptor?.stringValue {
-                    continuation.resume(returning: stringValue)
+                } else if let descriptor {
+                    continuation.resume(returning: Self.extractString(from: descriptor))
                 } else {
                     continuation.resume(returning: "")
                 }
             }
         }
+    }
+
+    /// Extracts text from AppleScript descriptors, recursively flattening nested lists (e.g. Excel cell ranges).
+    public static func extractString(from descriptor: NSAppleEventDescriptor) -> String {
+        if let str = descriptor.stringValue {
+            return str
+        }
+        if descriptor.numberOfItems > 0 {
+            var rows: [String] = []
+            for i in 1...descriptor.numberOfItems {
+                guard let item = descriptor.atIndex(i) else { continue }
+                if item.numberOfItems > 0 {
+                    var cols: [String] = []
+                    for j in 1...item.numberOfItems {
+                        if let cellStr = item.atIndex(j)?.stringValue {
+                            cols.append(cellStr)
+                        }
+                    }
+                    let rowStr = cols.joined(separator: "\t").trimmingCharacters(in: .whitespaces)
+                    if !rowStr.isEmpty {
+                        rows.append(rowStr)
+                    }
+                } else if let val = item.stringValue {
+                    rows.append(val)
+                }
+            }
+            return rows.joined(separator: "\n")
+        }
+        return ""
     }
 
     /// Press the Edit ▸ Copy menu item in `app`'s menu bar.

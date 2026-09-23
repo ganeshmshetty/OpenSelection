@@ -16,6 +16,24 @@ public enum AXWebAreaStrategy {
     /// kAXSelectedTextMarkerRange → AXStringForTextMarkerRange; bounds via
     /// AXBoundsForTextMarkerRange.
     public static func read(from target: AXElementInspector.Target) -> SelectionResult? {
+        // Fast path: use already resolved marker text from the inspect snapshot
+        if let markerText = target.selectedMarkerText, TextSanitizer.isSubstantial(markerText) {
+            let bounds: CGRect?
+            if let element = target.webArea ?? target.focusedElement,
+               let markerRange = target.selectedTextMarkerRange,
+               CFGetTypeID(markerRange) == AXTextMarkerRangeGetTypeID() {
+                bounds = Self.bounds(for: element, markerRange: markerRange as! AXTextMarkerRange)
+            } else {
+                bounds = target.bounds
+            }
+            return SelectionResult(
+                text: markerText,
+                bounds: bounds,
+                strategy: .axWebArea,
+                isEditable: false
+            )
+        }
+
         // Marker-range path. The marker range must actually be an AXTextMarkerRange before
         // the live web area is asked to resolve it; under a fixture it is a plain object and
         // this strategy falls through to selectedText below.

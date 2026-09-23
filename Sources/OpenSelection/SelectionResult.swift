@@ -66,7 +66,7 @@ public struct SelectionResult: Sendable, Equatable {
         if text.contains("\n") || text.contains("\r") {
             return text
         }
-        if let html, !html.isEmpty, let extracted = Self.plainText(fromHTML: html), !extracted.isEmpty {
+        if let html, !html.isEmpty, Self.hasBlockTags(html), let extracted = Self.plainText(fromHTML: html), !extracted.isEmpty {
             return extracted
         }
         // Native rich editors (Notes, Pages, TextEdit, Mail) often expose RTF without HTML.
@@ -74,6 +74,11 @@ public struct SelectionResult: Sendable, Equatable {
             return extracted
         }
         return text
+    }
+
+    /// Fast check for whether an HTML snippet contains structural block tags that would introduce line breaks.
+    public static func hasBlockTags(_ html: String) -> Bool {
+        html.range(of: "<(p|br|div|li|tr|h[1-6])[\\s/>]", options: [.regularExpression, .caseInsensitive]) != nil
     }
 
     /// Converts rich HTML into clean plain text preserving paragraph breaks.
