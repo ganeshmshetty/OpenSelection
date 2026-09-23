@@ -651,8 +651,10 @@ public struct SelectionRetrievalCoordinator: Sendable {
                 return "ax-selected-text-range(len=\(cfRange.length))"
             }
         }
-        if let role = target.role, textEvidenceRoles.contains(role) { return "ax-role:\(role)" }
-        if let role = target.containedInRoles.first(where: textEvidenceRoles.contains) { return "ax-ancestor-role:\(role)" }
+        if cursor != .arrow && cursor != .pointingHand {
+            if let role = target.role, textEvidenceRoles.contains(role) { return "ax-role:\(role)" }
+            if let role = target.containedInRoles.first(where: textEvidenceRoles.contains) { return "ax-ancestor-role:\(role)" }
+        }
         return nil
     }
 

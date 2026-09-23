@@ -87,7 +87,9 @@ public enum AppMatching: Sendable {
         "net.whatsapp.WhatsApp*",
         "com.spotify.client",
         "com.microsoft.teams*",
-        "com.insomnia.app"
+        "com.insomnia.app",
+        "com.tencent.xinWeChat*",
+        "com.tencent.WeChat*"
     ]
 
     public static let browserPatterns: [String] = safariGroup + chromiumGroup + firefoxGroup + arcGroup

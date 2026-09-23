@@ -162,9 +162,19 @@ public final class OpenSelectionMonitor {
         }
     }
 
+    /// Whether `point` is in macOS system chrome (Menu Bar or Dock) outside any screen's visible frame.
+    public static func isSystemChromeLocation(_ point: CGPoint) -> Bool {
+        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(point) }) else { return false }
+        return !screen.visibleFrame.contains(point)
+    }
+
     // MARK: - Event Handlers
 
     public func handleMouseDown(at point: CGPoint) {
+        guard !Self.isSystemChromeLocation(point) else {
+            mouseDownLocation = nil
+            return
+        }
         mouseDownLocation = point
     }
 
@@ -177,6 +187,9 @@ public final class OpenSelectionMonitor {
         mouseDownLocation = nil
 
         debounceTask?.cancel()
+
+        guard !Self.isSystemChromeLocation(cursor) else { return }
+        if let downPoint, Self.isSystemChromeLocation(downPoint) { return }
 
         guard !isSuppressed() else { return }
         guard !isSuppressedForApp(app.bundleIdentifier) else { return }

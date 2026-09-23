@@ -39,6 +39,17 @@ public enum CopyTriggerGate {
         "com.apple.wallpaper"
     ]
 
+    /// Bundle identifiers of system UI overlays (Control Center, Notification Center, etc.)
+    /// that float above applications. Interacting with these must never deliver synthetic copies
+    /// to background applications.
+    public static let systemUIBundleIDs: Set<String> = [
+        "com.apple.controlcenter",
+        "com.apple.notificationcenterui",
+        "com.apple.systemuiserver",
+        "com.apple.WindowManager",
+        "com.apple.Spotlight"
+    ]
+
     /// Whether `window` can own the key window that receives a synthetic ⌘C. Windows with no owning
     /// application (the window server) and system chrome cannot, so they must never be treated as
     /// copy-swallowing overlays.
@@ -51,7 +62,8 @@ public enum CopyTriggerGate {
     ///
     /// The only window that can swallow the synthetic ⌘C is one that owns the key window: an
     /// *elevated* window that *covers the display* — the profile of a capture/annotation tool's
-    /// full-screen picker, whether it belongs to another app or activates itself (CleanShot X).
+    /// full-screen picker, whether it belongs to another app or activates itself (CleanShot X) —
+    /// or an elevated System UI panel (Control Center, Notification Center).
     /// Windows that merely float above the point at a smaller size — a notch/HUD app's panel
     /// (NotchNook), a menu, a tooltip, an Electron helper window — never receive the copy, and
     /// treating them as overlays silently dropped legitimate selections. System chrome (the Dock,
@@ -70,6 +82,9 @@ public enum CopyTriggerGate {
             $0.layer >= 0 && $0.frame.contains(point) && Self.canOwnKeyWindow($0)
         }) else { return false }
         if top.ownerPID == selfPID { return false }   // our own popup is not a foreign overlay
+        if let bundleID = top.ownerBundleID, systemUIBundleIDs.contains(bundleID) && top.layer > 0 {
+            return true
+        }
         let coversDisplay = top.frame.width >= displayBounds.width - 1
             && top.frame.height >= displayBounds.height - 1
         return top.layer > 0 && coversDisplay
