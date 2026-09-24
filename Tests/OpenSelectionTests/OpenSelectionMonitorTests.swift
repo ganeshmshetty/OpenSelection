@@ -178,6 +178,41 @@ final class OpenSelectionMonitorTests: XCTestCase {
         XCTAssertEqual(box.result?.text, "word clicked")
     }
 
+    /// Regression: a drag that starts in a window and overshoots onto the menu bar or Dock — the
+    /// normal way of selecting text against a screen edge — was discarded because the *release*
+    /// point tested as chrome. Only the press decides whether the interaction is chrome.
+    func testDragEndingOverSystemChromeStillSelects() async {
+        let monitor = OpenSelectionMonitor(excludedBundleIDs: [])
+        let dummyApp = NSRunningApplication.current
+        monitor.frontmostAppProvider = { dummyApp }
+        monitor.isSystemChrome = { $0.x > 150 }   // only the release point classifies as chrome
+
+        let box = ResultBox()
+        monitor.onSelection = { box.result = $0 }
+        monitor.coordinator = SelectionRetrievalCoordinator(
+            inspect: { Self.textTarget(selectedText: "edge selection") }
+        )
+
+        monitor.handleMouseDown(at: CGPoint(x: 100, y: 100))
+        monitor.handleMouseUp(app: dummyApp, cursor: CGPoint(x: 200, y: 100), clickCount: 1)
+
+        if let debounce = monitor.debounceTask { _ = await debounce.value }
+        XCTAssertEqual(box.result?.text, "edge selection")
+    }
+
+    /// An interaction that begins on the menu bar or Dock is not a selection and must not trigger,
+    /// including a multi-click that would otherwise pass the click-count shortcut.
+    func testPressOnSystemChromeIsIgnored() async {
+        let monitor = OpenSelectionMonitor(excludedBundleIDs: [])
+        let dummyApp = NSRunningApplication.current
+        monitor.isSystemChrome = { _ in true }
+
+        monitor.handleMouseDown(at: CGPoint(x: 100, y: 100))
+        monitor.handleMouseUp(app: dummyApp, cursor: CGPoint(x: 100, y: 100), clickCount: 2)
+
+        XCTAssertNil(monitor.debounceTask)
+    }
+
     func testAppExclusionFiltersOutExcludedBundleID() async {
         guard let bundleID = NSRunningApplication.current.bundleIdentifier else { return }
         let monitor = OpenSelectionMonitor(excludedBundleIDs: [bundleID])

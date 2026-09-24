@@ -49,6 +49,10 @@ public final class OpenSelectionMonitor {
 
     internal var debounceTask: Task<Void, Never>?
     internal var mouseDownLocation: CGPoint?
+    /// Whether the press that started the current gesture landed on system chrome. Gate on this
+    /// (the press), not on where the pointer is released: a drag that begins in a window and
+    /// overshoots onto the menu bar or Dock is still a selection, while one that begins on chrome is not.
+    internal var mouseDownWasSystemChrome: Bool = false
 
     // Injectable seams for tests and headless verification
     public var frontmostAppProvider: @MainActor () -> NSRunningApplication? = { NSWorkspace.shared.frontmostApplication }
@@ -58,6 +62,9 @@ public final class OpenSelectionMonitor {
     public var now: @MainActor () -> Date = { Date() }
     public var isSuppressed: @MainActor () -> Bool = { false }
     public var isSuppressedForApp: @MainActor (String?) -> Bool = { _ in false }
+    /// Whether `point` sits on on-screen system chrome (the menu bar or Dock). Injectable so the
+    /// gesture logic can be exercised headlessly against a fixed geometry.
+    public var isSystemChrome: @MainActor (CGPoint) -> Bool = { OpenSelectionMonitor.isSystemChromeLocation($0) }
 
     public var coordinator: SelectionRetrievalCoordinator
 
@@ -162,19 +169,49 @@ public final class OpenSelectionMonitor {
         }
     }
 
-    /// Whether `point` is in macOS system chrome (Menu Bar or Dock) outside any screen's visible frame.
+    /// Whether `point` is on macOS system chrome (the menu bar or Dock) that is actually shown.
+    ///
+    /// This must not simply test "outside `visibleFrame`". That rectangle permanently reserves the
+    /// menu-bar strip even while the menu bar is hidden — auto-hidden, or a full-screen window that
+    /// only reveals it at the very top edge — so treating the whole strip as chrome discarded every
+    /// selection whose press or release landed near the top of the screen. A hidden menu bar is not
+    /// chrome. The Dock's reserved strip has the same failure mode: a window can extend into it
+    /// (a chat box at the very bottom of the screen), and the pointer there is over the window, not
+    /// the Dock, whenever the Dock is not actually shown. Both strips are chrome only while the
+    /// corresponding chrome is really on screen.
     public static func isSystemChromeLocation(_ point: CGPoint) -> Bool {
         guard let screen = NSScreen.screens.first(where: { $0.frame.contains(point) }) else { return false }
-        return !screen.visibleFrame.contains(point)
+        guard !screen.visibleFrame.contains(point) else { return false }
+        if point.y >= screen.visibleFrame.maxY {
+            return NSMenu.menuBarVisible()
+        }
+        return isDockOnScreen()
+    }
+
+    /// Whether the Dock's bar is actually on screen right now. `visibleFrame` keeps reserving the
+    /// Dock's strip even when the Dock is hidden or the pointer is over a window that extends into
+    /// it; the Dock's own on-screen window is the ground truth. Its background layers are always
+    /// present at negative levels, so only a non-negative level counts.
+    static func isDockOnScreen() -> Bool {
+        guard let raw = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else {
+            return true   // unknown: fail safe (treat as chrome) so a Dock interaction is never read
+        }
+        return raw.contains { info in
+            guard let layer = (info[kCGWindowLayer as String] as? NSNumber)?.intValue, layer >= 0,
+                  let pid = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value else { return false }
+            return NSRunningApplication(processIdentifier: pid)?.bundleIdentifier == "com.apple.dock"
+        }
     }
 
     // MARK: - Event Handlers
 
     public func handleMouseDown(at point: CGPoint) {
-        guard !Self.isSystemChromeLocation(point) else {
+        if isSystemChrome(point) {
             mouseDownLocation = nil
+            mouseDownWasSystemChrome = true
             return
         }
+        mouseDownWasSystemChrome = false
         mouseDownLocation = point
     }
 
@@ -183,13 +220,19 @@ public final class OpenSelectionMonitor {
     }
 
     public func handleMouseUp(app: NSRunningApplication, cursor: CGPoint, clickCount: Int) {
+        let wasSystemChrome = mouseDownWasSystemChrome
+        mouseDownWasSystemChrome = false
+
         let downPoint = mouseDownLocation
         mouseDownLocation = nil
 
         debounceTask?.cancel()
 
-        guard !Self.isSystemChromeLocation(cursor) else { return }
-        if let downPoint, Self.isSystemChromeLocation(downPoint) { return }
+        // Gate on where the press landed, not where the pointer came up: a drag that begins inside
+        // a window and overshoots onto the menu bar or Dock (the usual way of selecting text that
+        // sits against a screen edge) is still a legitimate selection. An interaction that *begins*
+        // on chrome is not.
+        guard !wasSystemChrome else { return }
 
         guard !isSuppressed() else { return }
         guard !isSuppressedForApp(app.bundleIdentifier) else { return }
