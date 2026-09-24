@@ -25,6 +25,11 @@ public struct AXElementInspector {
         public let webArea: AXUIElement?
         public let selectedText: String?
         public let selectedTextMarkerRange: AnyObject?
+        /// The element `selectedTextMarkerRange` was read from. The parameterized
+        /// `AXStringForTextMarkerRange` / `AXBoundsForTextMarkerRange` queries must be issued
+        /// against this owner: Chromium can collapse the page's selection when a marker range is
+        /// asked of a foreign element (e.g. the containing web area rather than the focused node).
+        public let selectedTextMarkerRangeOwner: AXUIElement?
         /// `AXStringForTextMarkerRange` for `selectedTextMarkerRange`, resolved at inspect time.
         /// A non-nil range whose string is empty/absent is not a real text selection (Figma's
         /// canvas reports a marker range with no text); a non-empty string is strong, cursor-
@@ -44,6 +49,7 @@ public struct AXElementInspector {
             webArea: AXUIElement? = nil,
             selectedText: String? = nil,
             selectedTextMarkerRange: AnyObject? = nil,
+            selectedTextMarkerRangeOwner: AXUIElement? = nil,
             selectedMarkerText: String? = nil,
             value: String? = nil,
             selectedTextRange: AnyObject? = nil,
@@ -58,6 +64,7 @@ public struct AXElementInspector {
             self.webArea = webArea
             self.selectedText = selectedText
             self.selectedTextMarkerRange = selectedTextMarkerRange
+            self.selectedTextMarkerRangeOwner = selectedTextMarkerRangeOwner
             self.selectedMarkerText = selectedMarkerText
             self.value = value
             self.selectedTextRange = selectedTextRange
@@ -146,6 +153,7 @@ public struct AXElementInspector {
             marker = nil
         }
         let selectedTextMarkerRange = marker?.range
+        let selectedTextMarkerRangeOwner = marker?.owner
         let selectedMarkerText = marker.flatMap { markerText(for: $0.owner, markerRange: $0.range) }
         let value = focusedElement.flatMap { read($0, kAXValueAttribute) as? String }
         let selectedTextRange = focusedElement.flatMap { read($0, kAXSelectedTextRangeAttribute) }
@@ -161,6 +169,7 @@ public struct AXElementInspector {
             webArea: webArea,
             selectedText: selectedText,
             selectedTextMarkerRange: selectedTextMarkerRange,
+            selectedTextMarkerRangeOwner: selectedTextMarkerRangeOwner,
             selectedMarkerText: selectedMarkerText,
             value: value,
             selectedTextRange: selectedTextRange,

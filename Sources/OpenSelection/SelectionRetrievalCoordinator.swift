@@ -96,10 +96,7 @@ public struct SelectionRetrievalCoordinator: Sendable {
                             cols.append(cellStr)
                         }
                     }
-                    let rowStr = cols.joined(separator: "\t").trimmingCharacters(in: .whitespaces)
-                    if !rowStr.isEmpty {
-                        rows.append(rowStr)
-                    }
+                    rows.append(cols.joined(separator: "\t"))
                 } else if let val = item.stringValue {
                     rows.append(val)
                 }

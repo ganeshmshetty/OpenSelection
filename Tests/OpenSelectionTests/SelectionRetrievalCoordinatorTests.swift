@@ -124,6 +124,10 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
         )
     }
 
+    /// The shipping default leaves `enrichRichContent` off so a successful AX read never posts a
+    /// synthetic copy. Tests that assert rich HTML/RTF/flavor capture must opt in explicitly.
+    private static let richCaptureConfiguration = SelectionConfiguration(enrichRichContent: true)
+
     // MARK: - Gate
 
     func testGateSkipsButtonRole() async {
@@ -707,16 +711,24 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
     }
 
     func testMarkerTextIsTextEvidence() async {
+        final class Counter: @unchecked Sendable { var calls = 0 }
+        let counter = Counter()
         let coordinator = SelectionRetrievalCoordinator(
             inspect: { Self.markerTextTarget("resolved web text") },
-            copyCapture: { _ in SelectionResult(text: "copied") }
+            copyCapture: { _ in
+                counter.calls += 1
+                return SelectionResult(text: "copied")
+            }
         )
         let result = await coordinator.retrieve(
             for: AppIdentity(bundleIdentifier: "com.hnc.Discord"),
             policy: AppPolicyContext(retrievalMode: .keyboardCopy),
             cursor: .arrow
         )
-        XCTAssertEqual(result?.text, "copied")
+        // A marker range that resolves to text is sufficient to return the selection directly;
+        // Electron/Chromium apps must not be sent a synthetic ⌘C when AX already has the text.
+        XCTAssertEqual(result?.text, "resolved web text")
+        XCTAssertEqual(counter.calls, 0, "resolved marker text must not trigger a synthetic copy")
     }
 
     func testSelectAllSkippedInsideRowContainer() async {
@@ -887,8 +899,32 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
 
     // MARK: - Rich-content enrichment
 
+    /// The default configuration disables enrichment: a successful AX read must not fire the
+    /// synthetic ⌘C that captures HTML/RTF/flavors, even for a web area.
+    func testDefaultConfigurationSkipsRichEnrichment() async {
+        final class Counter: @unchecked Sendable { var calls = 0 }
+        let counter = Counter()
+        let coordinator = SelectionRetrievalCoordinator(
+            inspect: { Self.webAreaTarget(selectedText: "plain selection") },
+            copyCapture: { _ in
+                counter.calls += 1
+                return SelectionResult(text: "rich selection", html: "<b>rich</b> selection")
+            }
+        )
+        let policy = AppPolicyContext(retrievalMode: .axWebArea)
+        let result = await coordinator.retrieve(
+            for: AppIdentity(bundleIdentifier: "com.google.Chrome"),
+            policy: policy,
+            cursor: .unknown
+        )
+        XCTAssertEqual(result?.text, "plain selection")
+        XCTAssertNil(result?.html)
+        XCTAssertEqual(counter.calls, 0, "the default configuration must not post a synthetic copy")
+    }
+
     func testTextOnlyWebAreaWinEnrichesFromPasteboardCapture() async {
         let coordinator = SelectionRetrievalCoordinator(
+            configuration: Self.richCaptureConfiguration,
             inspect: { Self.webAreaTarget(selectedText: "plain selection") },
             copyCapture: { _ in SelectionResult(text: "rich selection", html: "<b>rich</b> selection") }
         )
@@ -904,6 +940,7 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
 
     func testRichDocumentAppEnrichesFromPasteboardCapture() async {
         let coordinator = SelectionRetrievalCoordinator(
+            configuration: Self.richCaptureConfiguration,
             inspect: { Self.textFieldTarget(selectedText: "flattened notes text") },
             copyCapture: { _ in
                 SelectionResult(
@@ -1008,6 +1045,7 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
             settled: Self.webAreaTarget(selectedText: "settled web text")
         )
         let coordinator = SelectionRetrievalCoordinator(
+            configuration: Self.richCaptureConfiguration,
             inspect: { sequence.next() },
             copyCapture: { _ in SelectionResult(text: "rich settled", html: "<b>rich settled</b>") }
         )
@@ -1025,6 +1063,7 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
     /// enrichment even when no HTML/RTF was written. Dropping it silently lost app-private data.
     func testFlavorOnlyPasteboardCaptureIsRetained() async {
         let coordinator = SelectionRetrievalCoordinator(
+            configuration: Self.richCaptureConfiguration,
             inspect: { Self.webAreaTarget(selectedText: "plain web selection") },
             copyCapture: { _ in
                 SelectionResult(
@@ -1335,6 +1374,30 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
         let pptScript = SelectionRetrievalCoordinator.officeScript(for: "com.microsoft.Powerpoint")
         XCTAssertTrue(pptScript?.contains("com.microsoft.Powerpoint") == true)
         XCTAssertTrue(pptScript?.contains("content of text range of selection") == true)
+    }
+
+    /// Regression: a blank row inside a selected Excel range must survive as an empty line. The
+    /// 2D AppleScript descriptor's inner rows are flattened to TSV, so dropping an all-empty row
+    /// silently collapsed `A\n\nB` to `A\nB`.
+    func testExtractStringPreservesBlankRowInExcelRange() {
+        func row(_ cells: [String?]) -> NSAppleEventDescriptor {
+            let list = NSAppleEventDescriptor.list()
+            for (offset, cell) in cells.enumerated() {
+                let descriptor = cell.map { NSAppleEventDescriptor(string: $0) } ?? NSAppleEventDescriptor.null()
+                list.insert(descriptor, at: offset + 1)
+            }
+            return list
+        }
+        let range = NSAppleEventDescriptor.list()
+        range.insert(row(["A"]), at: 1)
+        range.insert(row([nil]), at: 2)
+        range.insert(row(["B"]), at: 3)
+
+        XCTAssertEqual(
+            SelectionRetrievalCoordinator.extractString(from: range),
+            "A\n\nB",
+            "A blank row inside an Excel range must stay as a row separator"
+        )
     }
 
     func testMicrosoftOfficeScriptTimeoutReturnsNil() async {
