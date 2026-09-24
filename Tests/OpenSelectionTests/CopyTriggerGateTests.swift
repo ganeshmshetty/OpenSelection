@@ -101,6 +101,47 @@ final class CopyTriggerGateTests: XCTestCase {
             frontmostPID: frontmost, selfPID: selfPID, displayBounds: display))
     }
 
+    /// Regression: Control Center keeps an invisible (alpha 0) full-height helper window on screen
+    /// at layer 22 covering the right of the display. It is not visible, not interactive, and can
+    /// never swallow the synthetic ⌘C, so treating it as an overlay stripped every copy-based read
+    /// whose point landed on the right half of the screen (e.g. text inputs in a browser).
+    func testInvisibleControlCenterHelperDoesNotSuppress() {
+        let windows = [
+            OnScreenWindowInfo(ownerPID: 999, ownerBundleID: "com.apple.controlcenter", layer: 22,
+                               frame: CGRect(x: 990, y: -11, width: 656, height: 967), alpha: 0.0),
+            OnScreenWindowInfo(ownerPID: frontmost, ownerBundleID: "com.apple.Safari", layer: 0, frame: display)
+        ]
+        XCTAssertFalse(CopyTriggerGate.isForeignOverlay(
+            windows: windows, at: CGPoint(x: 1200, y: 400),
+            frontmostPID: frontmost, selfPID: selfPID, displayBounds: display))
+    }
+
+    /// A System UI *panel* (Control Center's open panel, a notification banner) can swallow the
+    /// copy even though it does not cover the display, so it still suppresses.
+    func testVisibleSystemUIPanelSuppresses() {
+        let windows = [
+            OnScreenWindowInfo(ownerPID: 999, ownerBundleID: "com.apple.controlcenter", layer: 25,
+                               frame: CGRect(x: 1050, y: 500, width: 380, height: 440)),
+            OnScreenWindowInfo(ownerPID: frontmost, ownerBundleID: "com.apple.Safari", layer: 0, frame: display)
+        ]
+        XCTAssertTrue(CopyTriggerGate.isForeignOverlay(
+            windows: windows, at: CGPoint(x: 1200, y: 700),
+            frontmostPID: frontmost, selfPID: selfPID, displayBounds: display))
+    }
+
+    /// Regression: Notification Center's display-covering layer-21 backdrop is a transparent
+    /// click-catcher, not a panel. Treating it as an overlay suppressed every copy on screen for as
+    /// long as a notification was showing, so a selection far from the banner was dropped.
+    func testSystemUIDisplayCoveringBackdropDoesNotSuppress() {
+        let windows = [
+            OnScreenWindowInfo(ownerPID: 999, ownerBundleID: "com.apple.notificationcenterui", layer: 21, frame: display),
+            OnScreenWindowInfo(ownerPID: frontmost, ownerBundleID: "com.apple.Safari", layer: 0, frame: display)
+        ]
+        XCTAssertFalse(CopyTriggerGate.isForeignOverlay(
+            windows: windows, at: CGPoint(x: 570, y: 57),
+            frontmostPID: frontmost, selfPID: selfPID, displayBounds: display))
+    }
+
     /// A normal document window (layer 0) covering the display is not an overlay.
     func testFrontmostFullScreenNormalWindowIsNotOverlay() {
         let window = OnScreenWindowInfo(ownerPID: frontmost, layer: 0, frame: display)

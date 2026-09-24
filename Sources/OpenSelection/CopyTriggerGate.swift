@@ -19,12 +19,17 @@ public struct OnScreenWindowInfo: Equatable, Sendable {
     public let ownerBundleID: String?
     public let layer: Int
     public let frame: CGRect
+    /// The window's alpha (0 = fully transparent). System UI processes keep invisible helper
+    /// windows on screen at elevated layers; an invisible window can neither be interacted with
+    /// nor swallow a synthetic ⌘C, so it must never count as an overlay.
+    public let alpha: Double
 
-    public init(ownerPID: pid_t, ownerBundleID: String? = nil, layer: Int, frame: CGRect) {
+    public init(ownerPID: pid_t, ownerBundleID: String? = nil, layer: Int, frame: CGRect, alpha: Double = 1.0) {
         self.ownerPID = ownerPID
         self.ownerBundleID = ownerBundleID
         self.layer = layer
         self.frame = frame
+        self.alpha = alpha
     }
 }
 
@@ -39,9 +44,10 @@ public enum CopyTriggerGate {
         "com.apple.wallpaper"
     ]
 
-    /// Bundle identifiers of system UI overlays (Control Center, Notification Center, etc.)
-    /// that float above applications. Interacting with these must never deliver synthetic copies
-    /// to background applications.
+    /// Bundle identifiers of system UI *panels* (Control Center, Notification Center, etc.) that
+    /// float above applications. Interacting with these must never deliver synthetic copies to
+    /// background applications. Their display-covering backdrops are excluded by
+    /// `isForeignOverlay`, which would otherwise suppress every copy on screen while one is up.
     public static let systemUIBundleIDs: Set<String> = [
         "com.apple.controlcenter",
         "com.apple.notificationcenterui",
@@ -63,11 +69,12 @@ public enum CopyTriggerGate {
     /// The only window that can swallow the synthetic ⌘C is one that owns the key window: an
     /// *elevated* window that *covers the display* — the profile of a capture/annotation tool's
     /// full-screen picker, whether it belongs to another app or activates itself (CleanShot X) —
-    /// or an elevated System UI panel (Control Center, Notification Center).
+    /// or an elevated System UI *panel* (Control Center, Notification Center).
     /// Windows that merely float above the point at a smaller size — a notch/HUD app's panel
     /// (NotchNook), a menu, a tooltip, an Electron helper window — never receive the copy, and
     /// treating them as overlays silently dropped legitimate selections. System chrome (the Dock,
-    /// the window server) is likewise excluded by `canOwnKeyWindow`.
+    /// the window server) is likewise excluded by `canOwnKeyWindow`, and fully transparent helper
+    /// windows are excluded by `alpha`.
     public static func isForeignOverlay(
         windows: [OnScreenWindowInfo],
         at point: CGPoint,
@@ -77,16 +84,20 @@ public enum CopyTriggerGate {
     ) -> Bool {
         // Without a known frontmost app or display there is nothing to reason about: fail open.
         guard frontmostPID != nil, let displayBounds else { return false }
-        // Only windows that can own the key window are candidates; system chrome is skipped.
+        // Only visible windows that can own the key window are candidates; system chrome and
+        // invisible (alpha 0) helper windows are skipped.
         guard let top = windows.first(where: {
-            $0.layer >= 0 && $0.frame.contains(point) && Self.canOwnKeyWindow($0)
+            $0.layer >= 0 && $0.alpha > 0 && $0.frame.contains(point) && Self.canOwnKeyWindow($0)
         }) else { return false }
         if top.ownerPID == selfPID { return false }   // our own popup is not a foreign overlay
-        if let bundleID = top.ownerBundleID, systemUIBundleIDs.contains(bundleID) && top.layer > 0 {
-            return true
-        }
         let coversDisplay = top.frame.width >= displayBounds.width - 1
             && top.frame.height >= displayBounds.height - 1
+        if let bundleID = top.ownerBundleID, systemUIBundleIDs.contains(bundleID) && top.layer > 0 {
+            // A System UI *panel* can swallow the copy even though it does not cover the display.
+            // Its display-covering backdrop is a transparent click-catcher, not a panel: treating
+            // it as an overlay suppressed every copy on screen for as long as it was up.
+            return !coversDisplay
+        }
         return top.layer > 0 && coversDisplay
     }
 
@@ -107,9 +118,9 @@ public enum CopyTriggerGate {
         // Log the decision inputs only when we refuse, so a false positive is diagnosable from a
         // user's log dump instead of being an invisible "no selection".
         if suppressed {
-            let top = windows.first { $0.layer >= 0 && $0.frame.contains(point) }
+            let top = windows.first { $0.layer >= 0 && $0.alpha > 0 && $0.frame.contains(point) }
             let topDescription = top.map {
-                "owner=\($0.ownerPID) layer=\($0.layer) frame=(\(Int($0.frame.minX)),\(Int($0.frame.minY))) \(Int($0.frame.width))x\(Int($0.frame.height))"
+                "owner=\($0.ownerPID) layer=\($0.layer) alpha=\($0.alpha) frame=(\(Int($0.frame.minX)),\(Int($0.frame.minY))) \(Int($0.frame.width))x\(Int($0.frame.height))"
             } ?? "none"
             OpenSelectionLogging.log(
                 "copy gate: suppressed at (\(Int(point.x)),\(Int(point.y))) — frontmost=\(frontmostPID.map(String.init) ?? "nil") self=\(ProcessInfo.processInfo.processIdentifier) top[\(topDescription)]"
@@ -133,6 +144,7 @@ public enum CopyTriggerGate {
                   let cgBounds = CGRect(dictionaryRepresentation: boundsDict as CFDictionary),
                   let ownerNumber = info[kCGWindowOwnerPID as String] as? NSNumber,
                   let layerNumber = info[kCGWindowLayer as String] as? NSNumber else { return nil }
+            let alpha = (info[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1.0
             let cocoaFrame = CGRect(
                 x: cgBounds.minX,
                 y: primaryHeight - cgBounds.maxY,
@@ -145,7 +157,8 @@ public enum CopyTriggerGate {
                 ownerPID: ownerPID,
                 ownerBundleID: ownerBundleID,
                 layer: layerNumber.intValue,
-                frame: cocoaFrame
+                frame: cocoaFrame,
+                alpha: alpha
             )
         }
     }
