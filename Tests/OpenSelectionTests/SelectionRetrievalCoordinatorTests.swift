@@ -599,6 +599,26 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
         XCTAssertEqual(counter.calls, 0, "AXWebArea ancestry alone is not text evidence")
     }
 
+    /// Regression: a web text input is exposed as a text control, but the pointer can read as a
+    /// hand (a link/button near the input) or unknown while the selection is made. The focused/
+    /// ancestor text-control role is structural evidence, so it must permit the copy fallback
+    /// regardless of the cursor class — gating it on the cursor left the input unreadable.
+    func testCopyProceedsForTextControlRoleRegardlessOfCursor() async {
+        let policy = AppPolicyContext(retrievalMode: .keyboardCopy)
+        for cursor: CursorClass in [.pointingHand, .unknown, .arrow] {
+            let coordinator = SelectionRetrievalCoordinator(
+                inspect: { Self.opaqueTarget(containedInRoles: ["AXTextArea"]) },
+                copyCapture: { _ in SelectionResult(text: "captured via keyboard copy") }
+            )
+            let result = await coordinator.retrieve(
+                for: AppIdentity(bundleIdentifier: "com.google.Chrome"),
+                policy: policy,
+                cursor: cursor
+            )
+            XCTAssertEqual(result?.text, "captured via keyboard copy", "cursor=\(cursor.rawValue)")
+        }
+    }
+
     func testCopyEvidenceGateCanBeDisabledForExplicitTriggers() async {
         let coordinator = SelectionRetrievalCoordinator(
             inspect: { Self.opaqueTarget(containedInRoles: ["AXWebArea"]) },

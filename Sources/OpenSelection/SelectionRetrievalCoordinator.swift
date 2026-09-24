@@ -651,10 +651,13 @@ public struct SelectionRetrievalCoordinator: Sendable {
                 return "ax-selected-text-range(len=\(cfRange.length))"
             }
         }
-        if cursor != .arrow && cursor != .pointingHand {
-            if let role = target.role, textEvidenceRoles.contains(role) { return "ax-role:\(role)" }
-            if let role = target.containedInRoles.first(where: textEvidenceRoles.contains) { return "ax-ancestor-role:\(role)" }
-        }
+        // The focused/ancestor element being a text control is structural evidence that text is
+        // selected there, so it counts regardless of the pointer's cursor class. Gating it on the
+        // cursor (arrow/pointing-hand) discarded web text inputs, where the browser exposes the
+        // input as AXTextField/AXTextArea but the pointer can read as a hand or unknown while the
+        // selection is being made.
+        if let role = target.role, textEvidenceRoles.contains(role) { return "ax-role:\(role)" }
+        if let role = target.containedInRoles.first(where: textEvidenceRoles.contains) { return "ax-ancestor-role:\(role)" }
         return nil
     }
 
