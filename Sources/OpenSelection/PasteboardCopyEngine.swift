@@ -6,6 +6,7 @@
 // restores the original items tagged with transient markers.
 import AppKit
 import Foundation
+import os
 
 @MainActor
 public struct PasteboardCopyEngine {
@@ -44,6 +45,20 @@ public struct PasteboardCopyEngine {
         let snapshot = PasteboardSnapshot.capture(pasteboard)
         let initialChangeCount = pasteboard.changeCount
 
+        // Watch for the user's own ⌘C/⌘X while the synthetic copy is in flight. Our posted events
+        // carry `KeyboardEventPoster.syntheticEventTag`; anything untagged is the user, so the
+        // clipboard they just filled must never be clobbered by the snapshot restore below.
+        let userCopied = OSAllocatedUnfairLock(initialState: false)
+        let keyMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown]) { event in
+            guard event.modifierFlags.contains(.command),
+                  event.keyCode == 0x08 || event.keyCode == 0x07,   // kVK_ANSI_C / kVK_ANSI_X
+                  event.cgEvent?.getIntegerValueField(.eventSourceUserData)
+                      != KeyboardEventPoster.syntheticEventTag
+            else { return }
+            userCopied.withLock { $0 = true }
+        }
+        defer { if let keyMonitor { NSEvent.removeMonitor(keyMonitor) } }
+
         trigger()
 
         let resolvedTimeout = timeout ?? Self.pollingTimeout(for: NSWorkspace.shared.frontmostApplication?.bundleIdentifier, configuration: configuration)
@@ -52,6 +67,12 @@ public struct PasteboardCopyEngine {
         var result: SelectionResult?
 
         while Date() < deadline && !Task.isCancelled {
+            // The user copied — bail before touching the pasteboard and leave their content intact.
+            if userCopied.withLock({ $0 }) {
+                OpenSelectionLogging.log("copy engine: user copied during grab — leaving clipboard untouched")
+                return nil
+            }
+
             if pasteboard.changeCount != initialChangeCount {
                 if let candidate = pasteboard.string(forType: .string),
                    Self.hasSelection(candidate) {
@@ -63,6 +84,15 @@ public struct PasteboardCopyEngine {
                     let rawRTFData = pasteboard.data(forType: .rtf)
                     let rawRTFString = pasteboard.string(forType: .rtf)
                     let rawFlavors = Self.captureFlavors(from: pasteboard)
+                    let postCopyCount = pasteboard.changeCount
+
+                    // Grace window: a user's ⌘C landing a few ms after ours trips the flag or bumps
+                    // the changeCount again. The restore is only safe once neither has happened.
+                    try? await Task.sleep(nanoseconds: 30_000_000)
+                    guard !userCopied.withLock({ $0 }), pasteboard.changeCount == postCopyCount else {
+                        OpenSelectionLogging.log("copy engine: external copy detected — leaving clipboard untouched")
+                        return nil
+                    }
 
                     snapshot.restore(to: pasteboard, transientMarkers: true)
 
@@ -87,7 +117,7 @@ public struct PasteboardCopyEngine {
         }
 
         guard let result else {
-            if pasteboard.changeCount != initialChangeCount {
+            if pasteboard.changeCount != initialChangeCount, !userCopied.withLock({ $0 }) {
                 OpenSelectionLogging.log("copy engine: no non-empty pasteboard text within deadline; restoring immediately")
                 snapshot.restore(to: pasteboard, transientMarkers: true)
             }
