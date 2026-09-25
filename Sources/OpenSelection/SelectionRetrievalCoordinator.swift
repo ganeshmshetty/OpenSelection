@@ -153,13 +153,21 @@ public struct SelectionRetrievalCoordinator: Sendable {
 
         OpenSelectionLogging.log("coordinator: gate passed for \(app.bundleIdentifier ?? "unknown"); retrieving via \(policy.retrievalMode.rawValue)")
 
+        // Canvas editors like OneNote expose no AX text-selection evidence at all, so the
+        // copy-evidence gate would skip the one strategy that can read them. Waive it for known
+        // copy-fallback apps — the caller already decided a synthetic copy is allowed.
+        let evidenceRequired = requireCopyEvidence && !AppMatching.isCopyFallbackApp(app.bundleIdentifier)
+        if requireCopyEvidence, !evidenceRequired, let bundleID = app.bundleIdentifier {
+            OpenSelectionLogging.log("coordinator: \(bundleID) is a known copy-fallback app; allowing copy without AX evidence")
+        }
+
         let readResult = Self.nonBlank(await read(
             for: app,
             target: target,
             policy: policy,
             cursor: cursor,
             allowCopyFallback: allowCopyFallback,
-            requireCopyEvidence: requireCopyEvidence
+            requireCopyEvidence: evidenceRequired
         ))
         return (readResult, isEditable)
     }

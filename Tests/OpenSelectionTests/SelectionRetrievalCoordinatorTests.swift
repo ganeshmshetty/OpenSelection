@@ -394,6 +394,44 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
         XCTAssertEqual(result?.text, "captured keyboard copy")
     }
 
+    /// OneNote's canvas exposes no AX text-selection evidence (no cursor class, no
+    /// `AXSelectedText`/range, no text-control role), so the copy-evidence gate would skip the only
+    /// strategy that can read it and retrieval would always return nil. The allowlist waives the
+    /// gate so the copy fallback runs. Regression: mouse selections in OneNote produced no popup.
+    func testCopyFallbackAppBypassesEvidenceGate() async {
+        let coordinator = SelectionRetrievalCoordinator(
+            inspect: { Self.opaqueTarget() },
+            copyCapture: { _ in SelectionResult(text: "onenote selection") }
+        )
+        let result = await coordinator.retrieve(
+            for: AppIdentity(bundleIdentifier: "com.microsoft.onenote.mac"),
+            policy: AppPolicyContext.default,
+            cursor: .unknown
+        )
+        XCTAssertEqual(result?.text, "onenote selection")
+    }
+
+    /// The same evidence-free target must still be refused for an app that is not on the allowlist,
+    /// so the gate keeps protecting custom-drawn canvases (e.g. Figma object drags) from a spurious ⌘C.
+    func testNonCopyFallbackAppStillRequiresEvidence() async {
+        let tracker = CopyCallTracker()
+        let coordinator = SelectionRetrievalCoordinator(
+            inspect: { Self.opaqueTarget() },
+            copyCapture: { _ in
+                await tracker.recordCopy()
+                return SelectionResult(text: "should not be called")
+            }
+        )
+        let result = await coordinator.retrieve(
+            for: AppIdentity(bundleIdentifier: "com.figma.Desktop"),
+            policy: AppPolicyContext.default,
+            cursor: .unknown
+        )
+        XCTAssertNil(result)
+        let invoked = await tracker.copyInvoked
+        XCTAssertFalse(invoked, "the evidence gate must still block the copy for non-allowlisted apps")
+    }
+
     /// Electron/Chromium apps are copy-classified but should read AX first (non-destructively)
     /// before posting ⌘C: accessibility usually sees the selection once it is active.
     func testElectronKeyboardCopyPrefersAXTextOverCopy() async {

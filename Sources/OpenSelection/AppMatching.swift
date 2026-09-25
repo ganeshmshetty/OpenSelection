@@ -115,6 +115,21 @@ public enum AppMatching: Sendable {
         return microsoftOfficeGroup.contains(bundleID)
     }
 
+    /// Apps whose AX tree never exposes a text selection, so the only way to read them is to post a
+    /// synthetic copy. The copy-evidence gate is waived for these: with no cursor class, no
+    /// `AXSelectedText`/range, and no text-control role in the snapshot, the gate would skip the
+    /// copy strategy and retrieval would always return nil. Verified against Microsoft OneNote
+    /// (`com.microsoft.onenote.mac`), whose canvas exposes no `AXSelectedText` for a mouse selection
+    /// while ⌘C copies it correctly. Keep this list tight — every entry fires a real ⌘C on drag.
+    public static let copyFallbackApps: Set<String> = [
+        "com.microsoft.onenote.mac"
+    ]
+
+    public static func isCopyFallbackApp(_ bundleID: String?) -> Bool {
+        guard let bundleID else { return false }
+        return copyFallbackApps.contains(bundleID)
+    }
+
     public static let nativeApps: [String] = [
         "com.apple.TextEdit",
         "com.apple.mail",
