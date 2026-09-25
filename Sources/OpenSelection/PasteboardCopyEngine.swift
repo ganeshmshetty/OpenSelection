@@ -86,9 +86,13 @@ public struct PasteboardCopyEngine {
                     let rawFlavors = Self.captureFlavors(from: pasteboard)
                     let postCopyCount = pasteboard.changeCount
 
-                    // Grace window: a user's ⌘C landing a few ms after ours trips the flag or bumps
-                    // the changeCount again. The restore is only safe once neither has happened.
-                    try? await Task.sleep(nanoseconds: 30_000_000)
+                    // No suspension point may sit between reading the synthetic copy and restoring the
+                    // snapshot. While the unmarked copy is on the pasteboard a polling clipboard manager
+                    // (Maccy reads changeCount every 0.5s) can record it as a ghost history entry, and any
+                    // grace window here scales that ghost rate directly: 30ms / 0.5s ≈ 6%. The user-copy
+                    // guard is therefore evaluated synchronously — a real ⌘C/⌘X bumps the changeCount (and
+                    // the monitor above flags the untagged event even when it races ours), so restoring
+                    // the instant after the read keeps the exposure down to microseconds.
                     guard !userCopied.withLock({ $0 }), pasteboard.changeCount == postCopyCount else {
                         OpenSelectionLogging.log("copy engine: external copy detected — leaving clipboard untouched")
                         return nil
