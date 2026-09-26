@@ -300,4 +300,30 @@ final class OpenSelectionMonitorTests: XCTestCase {
         XCTAssertEqual(box.result?.text, "triggered text")
         monitor.stop()
     }
+
+    /// Regression: the chrome gate must treat the reserved strips as chrome only where the chrome
+    /// actually is. `visibleFrame` reserves the Dock's strip along the docked edge, but a window can
+    /// extend into that strip — so a boolean "is the Dock on screen" check discarded valid selections
+    /// anywhere along it (e.g. a chat box at the bottom of the screen with the Dock on the left).
+    func testSystemChromeGateOnlyTreatsStripsAsChromeUnderTheChrome() {
+        // Dock strip reserved along the bottom edge; menu-bar strip along the top.
+        let visibleFrame = CGRect(x: 0, y: 70, width: 1440, height: 830)
+        let dockOnLeftEdge = [CGRect(x: 0, y: 0, width: 70, height: 900)]
+
+        // A press in the bottom strip where a window extends over it — the Dock is on the left, so
+        // this is not chrome and the selection must survive.
+        XCTAssertFalse(OpenSelectionMonitor.isSystemChrome(
+            CGPoint(x: 400, y: 5), visibleFrame: visibleFrame,
+            menuBarVisible: true, dockFrames: dockOnLeftEdge))
+
+        // The same press with the Dock actually docked along that bottom edge: now it is chrome.
+        XCTAssertTrue(OpenSelectionMonitor.isSystemChrome(
+            CGPoint(x: 400, y: 5), visibleFrame: visibleFrame,
+            menuBarVisible: true, dockFrames: [CGRect(x: 0, y: 0, width: 1440, height: 70)]))
+
+        // Menu bar hidden (auto-hide / full-screen window): the top strip is not chrome either.
+        XCTAssertFalse(OpenSelectionMonitor.isSystemChrome(
+            CGPoint(x: 400, y: 1085), visibleFrame: visibleFrame,
+            menuBarVisible: false, dockFrames: dockOnLeftEdge))
+    }
 }

@@ -451,6 +451,29 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
         XCTAssertEqual(result?.text, "canvas selection")
     }
 
+    /// The structural waiver must not extend to item-selection surfaces: a drag across a Photos grid
+    /// or Mail list selects items, not text, and an opaque grid is as evidence-free as a OneNote
+    /// canvas. Posting a real ⌘C there copies image/file data and stalls the capture, so those
+    /// targets keep the evidence requirement.
+    func testItemSelectionSurfaceStillRequiresEvidence() async {
+        let tracker = CopyCallTracker()
+        let coordinator = SelectionRetrievalCoordinator(
+            inspect: { Self.opaqueTarget(containedInRoles: ["AXList"]) },
+            copyCapture: { _ in
+                await tracker.recordCopy()
+                return SelectionResult(text: "should not be called")
+            }
+        )
+        let result = await coordinator.retrieve(
+            for: AppIdentity(bundleIdentifier: "com.example.someopaquegrid"),
+            policy: AppPolicyContext.default,
+            cursor: .unknown
+        )
+        XCTAssertNil(result)
+        let invoked = await tracker.copyInvoked
+        XCTAssertFalse(invoked, "an item-selection surface must not get a speculative ⌘C")
+    }
+
     /// Electron/Chromium apps are copy-classified but should read AX first (non-destructively)
     /// before posting ⌘C: accessibility usually sees the selection once it is active.
     func testElectronKeyboardCopyPrefersAXTextOverCopy() async {

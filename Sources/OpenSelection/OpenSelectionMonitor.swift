@@ -177,29 +177,77 @@ public final class OpenSelectionMonitor {
     /// selection whose press or release landed near the top of the screen. A hidden menu bar is not
     /// chrome. The Dock's reserved strip has the same failure mode: a window can extend into it
     /// (a chat box at the very bottom of the screen), and the pointer there is over the window, not
-    /// the Dock, whenever the Dock is not actually shown. Both strips are chrome only while the
-    /// corresponding chrome is really on screen.
+    /// the Dock, whenever the Dock is not actually shown. Each strip counts as chrome only while the
+    /// chrome is on screen *and the point is actually over it* — see `isDockAt`.
     public static func isSystemChromeLocation(_ point: CGPoint) -> Bool {
         guard let screen = NSScreen.screens.first(where: { $0.frame.contains(point) }) else { return false }
-        guard !screen.visibleFrame.contains(point) else { return false }
-        if point.y >= screen.visibleFrame.maxY {
-            return NSMenu.menuBarVisible()
-        }
-        return isDockOnScreen()
+        return isSystemChrome(
+            point,
+            visibleFrame: screen.visibleFrame,
+            menuBarVisible: NSMenu.menuBarVisible(),
+            dockFrames: dockBarFrames()
+        )
     }
 
-    /// Whether the Dock's bar is actually on screen right now. `visibleFrame` keeps reserving the
-    /// Dock's strip even when the Dock is hidden or the pointer is over a window that extends into
-    /// it; the Dock's own on-screen window is the ground truth. Its background layers are always
-    /// present at negative levels, so only a non-negative level counts.
-    static func isDockOnScreen() -> Bool {
-        guard let raw = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else {
-            return true   // unknown: fail safe (treat as chrome) so a Dock interaction is never read
+    /// Pure form of the chrome gate, mirroring `CopyTriggerGate`'s split decision: the live wrapper
+    /// above gathers screen/window state, this decides. Keeps the whole gate — including the Dock
+    /// strip that `isDockAt` fixes — testable without the live window server.
+    public static func isSystemChrome(
+        _ point: CGPoint,
+        visibleFrame: CGRect,
+        menuBarVisible: Bool,
+        dockFrames: [CGRect]
+    ) -> Bool {
+        guard !visibleFrame.contains(point) else { return false }
+        if point.y >= visibleFrame.maxY {
+            return menuBarVisible
         }
-        return raw.contains { info in
+        return isDockAt(point, dockFrames: dockFrames)
+    }
+
+    /// Whether `point` is actually over the Dock's bar.
+    ///
+    /// This has to be a *geometric* test, not "a Dock window exists somewhere on screen".
+    /// `visibleFrame` reserves the Dock's strip only along the edge the Dock is docked to, but a
+    /// window can extend into that strip (a chat box at the very bottom of the screen) while the
+    /// Dock itself sits on the left edge. A boolean "is the Dock on screen" check therefore
+    /// classified every press in that strip as chrome and discarded the selection.
+    ///
+    /// Fails open when the window list is unreadable: a press on the Dock yields no text selection
+    /// anyway, so letting the cascade run costs nothing, whereas failing closed silently drops
+    /// valid selections anywhere along the reserved strip.
+    static func isDockAt(_ point: CGPoint) -> Bool {
+        isDockAt(point, dockFrames: dockBarFrames())
+    }
+
+    /// Pure decision over the Dock's on-screen bar frames (Cocoa coordinates), so the geometry is
+    /// unit-testable without the live window server.
+    static func isDockAt(_ point: CGPoint, dockFrames: [CGRect]) -> Bool {
+        dockFrames.contains { $0.contains(point) }
+    }
+
+    /// Bounds of the Dock's on-screen bar windows, in Cocoa coordinates. The Dock's background
+    /// layers are always present at negative levels, so only non-negative levels count as the bar.
+    /// An unreadable window list yields no frames, which `isDockAt` treats as "not the Dock".
+    static func dockBarFrames() -> [CGRect] {
+        guard let raw = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else {
+            return []
+        }
+        let primaryHeight = NSScreen.screens.first(where: { $0.frame.origin == .zero })?.frame.height
+            ?? NSScreen.screens.first?.frame.height
+            ?? 0
+        return raw.compactMap { info in
             guard let layer = (info[kCGWindowLayer as String] as? NSNumber)?.intValue, layer >= 0,
-                  let pid = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value else { return false }
-            return NSRunningApplication(processIdentifier: pid)?.bundleIdentifier == "com.apple.dock"
+                  let pid = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+                  NSRunningApplication(processIdentifier: pid)?.bundleIdentifier == "com.apple.dock",
+                  let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
+                  let cgBounds = CGRect(dictionaryRepresentation: boundsDict as CFDictionary) else { return nil }
+            return CGRect(
+                x: cgBounds.minX,
+                y: primaryHeight - cgBounds.maxY,
+                width: cgBounds.width,
+                height: cgBounds.height
+            )
         }
     }
 

@@ -161,9 +161,16 @@ public struct SelectionRetrievalCoordinator: Sendable {
         //    canvases) can never yield AX evidence, so requiring it permanently skips the one
         //    strategy that works. Web/Electron canvases stay protected: an AXWebArea ancestor
         //    makes the target text-bearing, so Figma-style object drags still require evidence.
+        //
+        // Item-selection surfaces are excluded from (2). A drag across a Photos grid, Mail list or
+        // Finder column selects *items*, not text, and an opaque grid is exactly as evidence-free as
+        // a OneNote canvas — but posting a real ⌘C there copies image/file data and stalls the
+        // capture for the full polling timeout, so those targets keep the evidence requirement.
+        let isItemSelectionSurface = target.role.map { Self.rowSelectionRoles.contains($0) } == true
+            || !target.containedInRoles.isDisjoint(with: Self.rowSelectionRoles)
         let evidenceRequired = requireCopyEvidence
             && !AppMatching.isCopyFallbackApp(app.bundleIdentifier)
-            && Self.isTextBearing(target)
+            && (Self.isTextBearing(target) || isItemSelectionSurface)
         if requireCopyEvidence, !evidenceRequired, let bundleID = app.bundleIdentifier {
             OpenSelectionLogging.log("coordinator: \(bundleID) exposes no AX text surface (or is a known copy-fallback app); allowing copy without AX evidence")
         }

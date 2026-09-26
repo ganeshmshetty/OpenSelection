@@ -65,11 +65,25 @@ public struct PasteboardCopyEngine {
         let pollInterval: TimeInterval = 0.001
         let deadline = Date().addingTimeInterval(resolvedTimeout)
         var result: SelectionResult?
+        // changeCount captured the instant our own synthetic copy was read. The user-copy bail-out
+        // below needs it to tell "the user copied something" (their content is now on the pasteboard
+        // — leave it alone) from "the user pressed ⌘C and it copied nothing" (the pasteboard still
+        // holds OUR synthetic copy, so the snapshot must be restored or their clipboard is lost).
+        var postCopyCount: Int?
 
         while Date() < deadline && !Task.isCancelled {
-            // The user copied — bail before touching the pasteboard and leave their content intact.
+            // The user pressed ⌘C/⌘X while our copy was in flight. Bail either way, but only restore
+            // when the pasteboard provably still holds our own copy: an untagged keydown does not
+            // guarantee a clipboard write (no selection, or an app that ignores the shortcut), and
+            // skipping the restore in that case would replace the user's clipboard with our
+            // synthetic selection.
             if userCopied.withLock({ $0 }) {
-                OpenSelectionLogging.log("copy engine: user copied during grab — leaving clipboard untouched")
+                Self.restoreAfterUserCopyIfNeeded(
+                    changeCount: pasteboard.changeCount,
+                    postCopyCount: postCopyCount,
+                    snapshot: snapshot,
+                    pasteboard: pasteboard
+                )
                 return nil
             }
 
@@ -84,7 +98,8 @@ public struct PasteboardCopyEngine {
                     let rawRTFData = pasteboard.data(forType: .rtf)
                     let rawRTFString = pasteboard.string(forType: .rtf)
                     let rawFlavors = Self.captureFlavors(from: pasteboard)
-                    let postCopyCount = pasteboard.changeCount
+                    let observedCopyCount = pasteboard.changeCount
+                    postCopyCount = observedCopyCount
 
                     // No suspension point may sit between reading the synthetic copy and restoring the
                     // snapshot. While the unmarked copy is on the pasteboard a polling clipboard manager
@@ -93,7 +108,12 @@ public struct PasteboardCopyEngine {
                     // guard is therefore evaluated synchronously — a real ⌘C/⌘X bumps the changeCount (and
                     // the monitor above flags the untagged event even when it races ours), so restoring
                     // the instant after the read keeps the exposure down to microseconds.
-                    guard !userCopied.withLock({ $0 }), pasteboard.changeCount == postCopyCount else {
+                    //
+                    // An untagged ⌘C/⌘X that copied *nothing* leaves the changeCount untouched, so it
+                    // falls through to the restore below: the pasteboard still holds our synthetic copy,
+                    // and bailing out would leave it there in place of the user's clipboard. A user copy
+                    // that really landed advanced the changeCount and takes the bail-out instead.
+                    guard pasteboard.changeCount == observedCopyCount else {
                         OpenSelectionLogging.log("copy engine: external copy detected — leaving clipboard untouched")
                         return nil
                     }
@@ -104,6 +124,7 @@ public struct PasteboardCopyEngine {
                     let html = rawHTML ?? rawRTFData.flatMap(Self.htmlFromRTFData)
                     let rtf = rawRTFData.flatMap(RichTextCoding.string(from:))
                         ?? rawRTFString
+                        ?? rawHTML.flatMap(Self.rtfFromHTML)
 
                     result = SelectionResult(
                         text: candidate,
@@ -121,7 +142,10 @@ public struct PasteboardCopyEngine {
         }
 
         guard let result else {
-            if pasteboard.changeCount != initialChangeCount, !userCopied.withLock({ $0 }) {
+            let changeCount = pasteboard.changeCount
+            let userCopyLanded = userCopied.withLock({ $0 })
+                && !Self.shouldRestoreAfterUserCopy(changeCount: changeCount, postCopyCount: postCopyCount)
+            if changeCount != initialChangeCount, !userCopyLanded {
                 OpenSelectionLogging.log("copy engine: no non-empty pasteboard text within deadline; restoring immediately")
                 snapshot.restore(to: pasteboard, transientMarkers: true)
             }
@@ -129,6 +153,38 @@ public struct PasteboardCopyEngine {
         }
 
         return result
+    }
+
+    /// Whether the snapshot must be restored after a user ⌘C/⌘X was observed mid-grab.
+    ///
+    /// An untagged copy keydown does not guarantee a clipboard write: with nothing selected, or in an
+    /// app that ignores the shortcut, the pasteboard is untouched and still holds OUR synthetic copy.
+    /// Bailing out without a restore in that case silently replaces the user's clipboard with our
+    /// selection. So restore whenever nothing has landed since we read our own copy. When the user
+    /// really did copy — the changeCount advanced past our read, or we never saw our copy land at
+    /// all — their content is on the pasteboard and must be left alone.
+    static func shouldRestoreAfterUserCopy(changeCount: Int, postCopyCount: Int?) -> Bool {
+        guard let postCopyCount else { return false }
+        return changeCount == postCopyCount
+    }
+
+    /// Applies the restore half of that decision to the pasteboard. Returns whether the snapshot was
+    /// restored. Internal rather than private so the restore-vs-leave contract is testable directly,
+    /// without racing a real untagged key event to set the flag.
+    @discardableResult
+    static func restoreAfterUserCopyIfNeeded(
+        changeCount: Int,
+        postCopyCount: Int?,
+        snapshot: PasteboardSnapshot,
+        pasteboard: NSPasteboard
+    ) -> Bool {
+        guard shouldRestoreAfterUserCopy(changeCount: changeCount, postCopyCount: postCopyCount) else {
+            OpenSelectionLogging.log("copy engine: user copied during grab — leaving clipboard untouched")
+            return false
+        }
+        snapshot.restore(to: pasteboard, transientMarkers: true)
+        OpenSelectionLogging.log("copy engine: user copy wrote nothing to the pasteboard; restored the snapshot over our stale synthetic copy")
+        return true
     }
 
     /// Per-app copy polling timeout. Browsers and Electron apps need more time for multi-process IPC clipboard operations to stabilize.
@@ -156,8 +212,24 @@ public struct PasteboardCopyEngine {
         TextSanitizer.isSubstantial(text)
     }
 
-    /// Captures every declared type on the pasteboard's first item as raw bytes, excluding the
-    /// transient/auto-generated markers OpenSelection writes. Preserving the full item is what lets
+    /// Pasteboard types read eagerly when capturing a selection's flavors.
+    ///
+    /// Deliberately an allowlist, not "every declared type". A type backed by a data provider is
+    /// fetched cross-process and synchronously, so reading it while the *unmarked* synthetic copy is
+    /// still on the pasteboard holds that content exposed for as long as the provider takes —
+    /// reopening exactly the ghost-entry window the read-then-restore ordering exists to close, and
+    /// invisibly to the in-process ghost test (which can only sample at suspension points). Only
+    /// types that are already materialized are read: the text/rich-text formats OpenClip acts on and
+    /// the app-private representation it round-trips (Notes checklists). A promised type is left to
+    /// the snapshot restore rather than blocking the capture.
+    static let eagerFlavorTypes: Set<NSPasteboard.PasteboardType> = [
+        .string, .html, .rtf, .rtfd, .pdf,
+        NSPasteboard.PasteboardType("public.tab-separated-text"),
+        NSPasteboard.PasteboardType("com.apple.notes.richtext")
+    ]
+
+    /// Captures the eagerly-materialized types on the pasteboard's first item as raw bytes, excluding
+    /// the transient/auto-generated markers OpenSelection writes. Preserving these is what lets
     /// app-private representations (Notes checklists, etc.) survive a copy→paste round trip.
     static func captureFlavors(from pasteboard: NSPasteboard) -> [PasteboardFlavor] {
         guard let item = pasteboard.pasteboardItems?.first else { return [] }
@@ -169,6 +241,7 @@ public struct PasteboardCopyEngine {
         ]
         return item.types.compactMap { type in
             guard !ignored.contains(type),
+                  eagerFlavorTypes.contains(type),
                   let data = item.data(forType: type) else { return nil }
             return PasteboardFlavor(type: type.rawValue, data: data)
         }

@@ -160,6 +160,121 @@ final class PasteboardCopyEngineTests: XCTestCase {
         XCTAssertEqual(pasteboard.changeCount, initialChangeCount)
         XCTAssertEqual(pasteboard.string(forType: .string), "Original")
     }
+
+    /// Regression: a user ⌘C/⌘X that copies *nothing* (no selection, or an app that ignores the
+    /// shortcut) must not leave our synthetic copy sitting on the pasteboard in place of the user's
+    /// clipboard. Restoring is only correct while nothing has landed since we read our own copy.
+    @MainActor
+    func testRestoreAfterUserCopyOnlyWhenNothingLandedSinceOurCopy() {
+        // ⌘C with nothing selected: the pasteboard still holds our copy → restore.
+        XCTAssertTrue(PasteboardCopyEngine.shouldRestoreAfterUserCopy(changeCount: 42, postCopyCount: 42))
+        // The user's copy really landed → leave their content alone.
+        XCTAssertFalse(PasteboardCopyEngine.shouldRestoreAfterUserCopy(changeCount: 43, postCopyCount: 42))
+        // We never saw our own copy land (user copied first) → nothing of ours to replace.
+        XCTAssertFalse(PasteboardCopyEngine.shouldRestoreAfterUserCopy(changeCount: 42, postCopyCount: nil))
+    }
+
+    /// The wiring matters as much as the decision: a user ⌘C that copied nothing must actually put
+    /// the snapshot back, and a user ⌘C that really landed must actually be left alone.
+    @MainActor
+    func testUserCopyBailOutRestoresOnlyWhenOurCopyIsStillExposed() {
+        let pasteboard = makePasteboard()
+        pasteboard.setString("User clipboard", forType: .string)
+        let snapshot = PasteboardSnapshot.capture(pasteboard)
+
+        // The synthetic copy landed and is what the pasteboard still holds; the user then pressed ⌘C
+        // with nothing selected, so nothing was written.
+        pasteboard.clearContents()
+        pasteboard.setString("Synthetic selection", forType: .string)
+        let ourCopyCount = pasteboard.changeCount
+
+        let restored = PasteboardCopyEngine.restoreAfterUserCopyIfNeeded(
+            changeCount: pasteboard.changeCount,
+            postCopyCount: ourCopyCount,
+            snapshot: snapshot,
+            pasteboard: pasteboard
+        )
+        XCTAssertTrue(restored)
+        XCTAssertEqual(pasteboard.string(forType: .string), "User clipboard",
+                       "our synthetic copy must not be left in place of the user's clipboard")
+
+        // Now the user's own copy has landed on top: leave it untouched.
+        pasteboard.clearContents()
+        pasteboard.setString("Fresh user copy", forType: .string)
+        let leftAlone = PasteboardCopyEngine.restoreAfterUserCopyIfNeeded(
+            changeCount: pasteboard.changeCount,
+            postCopyCount: ourCopyCount,
+            snapshot: snapshot,
+            pasteboard: pasteboard
+        )
+        XCTAssertFalse(leftAlone)
+        XCTAssertEqual(pasteboard.string(forType: .string), "Fresh user copy")
+    }
+
+    /// The synthetic copy is on the pasteboard and the user copies nothing: the engine must put the
+    /// snapshot back rather than leave the copy exposed. End-to-end shape of the bail-out path —
+    /// `postCopyCount` is nil here because the copy is never observed as a candidate.
+    @MainActor
+    func testCopyLeftOnPasteboardIsNotReportedAsASelection() async {
+        let pasteboard = makePasteboard()
+        pasteboard.setString("Original", forType: .string)
+
+        let engine = PasteboardCopyEngine()
+        // Writes a copy that carries no substantial text: the engine reads nothing substantial and
+        // must still restore, leaving the user's clipboard exactly as it found it.
+        let captured = await engine.capture(pasteboard: pasteboard, timeout: 0.05) {
+            pasteboard.clearContents()
+            pasteboard.setString(" ", forType: .string)
+        }
+
+        XCTAssertNil(captured)
+        XCTAssertEqual(pasteboard.string(forType: .string), "Original")
+    }
+
+    /// Regression: reading *every* declared type can block on a data provider, holding the unmarked
+    /// synthetic copy exposed. Only the eagerly-materialized types are read.
+    @MainActor
+    func testFlavorCaptureSkipsTypesOutsideTheEagerAllowlist() async {
+        let pasteboard = makePasteboard()
+        pasteboard.setString("Original", forType: .string)
+        let lazyType = NSPasteboard.PasteboardType("com.openselection.tests.lazy")
+
+        let engine = PasteboardCopyEngine()
+        let captured = await engine.capture(pasteboard: pasteboard) {
+            pasteboard.clearContents()
+            let item = NSPasteboardItem()
+            item.setString("Copied", forType: .string)
+            item.setData(Data("{\\rtf1 x}".utf8), forType: .rtf)
+            item.setDataProvider(DummyLazyDataProvider(), forTypes: [lazyType])
+            pasteboard.writeObjects([item])
+        }
+
+        let flavors = try? XCTUnwrap(captured?.flavors)
+        XCTAssertTrue(flavors?.contains { $0.type == "public.rtf" } == true)
+        XCTAssertFalse(flavors?.contains { $0.type == lazyType.rawValue } == true,
+                       "a provider-backed type must not be read while the synthetic copy is exposed")
+    }
+
+    /// Regression (0.2.4): the HTML→RTF fallback was dropped from the post-restore conversion, so a
+    /// source that supplies HTML but no RTF lost the RTF representation callers rely on.
+    @MainActor
+    func testHTMLOnlyCopyStillDerivesRTF() async {
+        let pasteboard = makePasteboard()
+        pasteboard.setString("Original", forType: .string)
+
+        let engine = PasteboardCopyEngine()
+        let captured = await engine.capture(pasteboard: pasteboard) {
+            pasteboard.clearContents()
+            let item = NSPasteboardItem()
+            item.setString("Copied", forType: .string)
+            item.setData(Data("<p>Copied</p>".utf8), forType: .html)
+            pasteboard.writeObjects([item])
+        }
+
+        XCTAssertEqual(captured?.text, "Copied")
+        XCTAssertNotNil(captured?.html)
+        XCTAssertNotNil(captured?.rtf, "an HTML-only copy must still yield an RTF representation")
+    }
 }
 
 private final class DummyLazyDataProvider: NSObject, NSPasteboardItemDataProvider {
