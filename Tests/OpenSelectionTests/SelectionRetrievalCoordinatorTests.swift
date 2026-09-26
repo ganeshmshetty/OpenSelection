@@ -411,12 +411,14 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
         XCTAssertEqual(result?.text, "onenote selection")
     }
 
-    /// The same evidence-free target must still be refused for an app that is not on the allowlist,
-    /// so the gate keeps protecting custom-drawn canvases (e.g. Figma object drags) from a spurious ⌘C.
+    /// The evidence gate must still protect custom-drawn web canvases (e.g. Figma object drags)
+    /// from a spurious ⌘C. Figma is Electron, so its inspect target sits inside an AXWebArea —
+    /// that web-area surface is exactly what keeps the evidence requirement in force now that the
+    /// waiver is structural (no-text-surface) rather than a bundle-ID allowlist.
     func testNonCopyFallbackAppStillRequiresEvidence() async {
         let tracker = CopyCallTracker()
         let coordinator = SelectionRetrievalCoordinator(
-            inspect: { Self.opaqueTarget() },
+            inspect: { Self.opaqueTarget(containedInRoles: ["AXWebArea"]) },
             copyCapture: { _ in
                 await tracker.recordCopy()
                 return SelectionResult(text: "should not be called")
@@ -429,7 +431,24 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
         )
         XCTAssertNil(result)
         let invoked = await tracker.copyInvoked
-        XCTAssertFalse(invoked, "the evidence gate must still block the copy for non-allowlisted apps")
+        XCTAssertFalse(invoked, "the evidence gate must still block the copy for web-canvas apps")
+    }
+
+    /// The structural waiver generalizes the OneNote allowlist: any app whose AX tree exposes no
+    /// text surface at all (no selected text/range, no text-control role, no containing AXWebArea)
+    /// gets one speculative copy attempt per gesture, because a synthetic copy is the only read
+    /// that can ever succeed there. No bundle-ID entry required.
+    func testOpaqueNativeAppWithoutTextSurfaceBypassesEvidenceGate() async {
+        let coordinator = SelectionRetrievalCoordinator(
+            inspect: { Self.opaqueTarget() },
+            copyCapture: { _ in SelectionResult(text: "canvas selection") }
+        )
+        let result = await coordinator.retrieve(
+            for: AppIdentity(bundleIdentifier: "com.example.someopaquecanvas"),
+            policy: AppPolicyContext.default,
+            cursor: .unknown
+        )
+        XCTAssertEqual(result?.text, "canvas selection")
     }
 
     /// Electron/Chromium apps are copy-classified but should read AX first (non-destructively)

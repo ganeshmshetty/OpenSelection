@@ -120,7 +120,12 @@ public enum AppMatching: Sendable {
     /// `AXSelectedText`/range, and no text-control role in the snapshot, the gate would skip the
     /// copy strategy and retrieval would always return nil. Verified against Microsoft OneNote
     /// (`com.microsoft.onenote.mac`), whose canvas exposes no `AXSelectedText` for a mouse selection
-    /// while ⌘C copies it correctly. Keep this list tight — every entry fires a real ⌘C on drag.
+    /// while ⌘C copies it correctly.
+    ///
+    /// The coordinator also waives the gate structurally for any target with no AX text surface
+    /// (no text roles/range and no containing AXWebArea), so new OneNote-class native canvases are
+    /// covered without an entry here. Only add an app when its target *is* text-bearing yet still
+    /// needs the copy. Keep this list tight — every entry fires a real ⌘C on drag.
     public static let copyFallbackApps: Set<String> = [
         "com.microsoft.onenote.mac"
     ]

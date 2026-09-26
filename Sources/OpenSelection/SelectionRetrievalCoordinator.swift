@@ -153,12 +153,19 @@ public struct SelectionRetrievalCoordinator: Sendable {
 
         OpenSelectionLogging.log("coordinator: gate passed for \(app.bundleIdentifier ?? "unknown"); retrieving via \(policy.retrievalMode.rawValue)")
 
-        // Canvas editors like OneNote expose no AX text-selection evidence at all, so the
-        // copy-evidence gate would skip the one strategy that can read them. Waive it for known
-        // copy-fallback apps — the caller already decided a synthetic copy is allowed.
-        let evidenceRequired = requireCopyEvidence && !AppMatching.isCopyFallbackApp(app.bundleIdentifier)
+        // Waive the copy-evidence gate when a synthetic copy is the only read that can possibly
+        // succeed, decided structurally rather than by bundle identity:
+        // 1. The app is a known copy-fallback app (the OneNote allowlist), or
+        // 2. the inspect target exposes no text surface at all — no selected text/range, no text
+        //    role, no containing AXWebArea. An AX tree like that (OneNote-class native opaque
+        //    canvases) can never yield AX evidence, so requiring it permanently skips the one
+        //    strategy that works. Web/Electron canvases stay protected: an AXWebArea ancestor
+        //    makes the target text-bearing, so Figma-style object drags still require evidence.
+        let evidenceRequired = requireCopyEvidence
+            && !AppMatching.isCopyFallbackApp(app.bundleIdentifier)
+            && Self.isTextBearing(target)
         if requireCopyEvidence, !evidenceRequired, let bundleID = app.bundleIdentifier {
-            OpenSelectionLogging.log("coordinator: \(bundleID) is a known copy-fallback app; allowing copy without AX evidence")
+            OpenSelectionLogging.log("coordinator: \(bundleID) exposes no AX text surface (or is a known copy-fallback app); allowing copy without AX evidence")
         }
 
         let readResult = Self.nonBlank(await read(
