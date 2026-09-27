@@ -75,6 +75,28 @@ final class CopyTriggerGateTests: XCTestCase {
             frontmostPID: frontmost, selfPID: selfPID, displayBounds: display))
     }
 
+    /// Normal applications (Ghostty, Chrome, Safari, etc.) in fullscreen (layer 500) belong
+    /// to the frontmost application and are not capture overlays, so synthetic copy is allowed.
+    func testFrontmostFullScreenElevatedNormalAppIsNotOverlay() {
+        let window = OnScreenWindowInfo(ownerPID: frontmost, ownerBundleID: "com.mitchellh.ghostty", layer: 500, frame: display)
+        XCTAssertFalse(CopyTriggerGate.isForeignOverlay(
+            windows: [window], at: CGPoint(x: 700, y: 400),
+            frontmostPID: frontmost, selfPID: selfPID, displayBounds: display))
+    }
+
+    /// Background utilities (Mac Mouse Fix, HazeOver, etc.) keep display-covering tracking or
+    /// dimmer windows on screen (often at layer >= 1000). They never own key window and must
+    /// not suppress copy in the frontmost app underneath.
+    func testUtilityOverlayWindowDoesNotSuppress() {
+        let windows = [
+            OnScreenWindowInfo(ownerPID: 999, ownerBundleID: "com.nuebling.mac-mouse-fix.helper", layer: 2147483628, frame: display),
+            OnScreenWindowInfo(ownerPID: frontmost, ownerBundleID: "com.mitchellh.ghostty", layer: 0, frame: display)
+        ]
+        XCTAssertFalse(CopyTriggerGate.isForeignOverlay(
+            windows: windows, at: CGPoint(x: 500, y: 400),
+            frontmostPID: frontmost, selfPID: selfPID, displayBounds: display))
+    }
+
     /// Regression (#104): on macOS 26 with the Dock visible, the Dock owns a full-screen layer-20
     /// window that covers the display. It never owns an app's key window, so it must not be mistaken
     /// for a capture overlay — doing so stripped the copy fallback and killed every selection in

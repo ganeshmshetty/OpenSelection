@@ -44,6 +44,18 @@ public enum CopyTriggerGate {
         "com.apple.wallpaper"
     ]
 
+    /// Bundle identifiers of utility tools (mouse helpers, dimmers, window managers, HUDs) that keep
+    /// full-screen or elevated tracking/display windows on screen. These helper windows are transparent
+    /// or non-interactive event taps that never receive or swallow a synthetic ⌘C.
+    public static let utilityOverlayBundleIDs: Set<String> = [
+        "com.nuebling.mac-mouse-fix",
+        "com.nuebling.mac-mouse-fix.helper",
+        "com.pointum.hazeover",
+        "com.stonerl.Thaw",
+        "iordv.Droppy",
+        "lo.cafe.NotchNook"
+    ]
+
     /// Bundle identifiers of system UI *panels* (Control Center, Notification Center, etc.) that
     /// float above applications. Interacting with these must never deliver synthetic copies to
     /// background applications. Their display-covering backdrops are excluded by
@@ -56,12 +68,35 @@ public enum CopyTriggerGate {
         "com.apple.Spotlight"
     ]
 
+    /// Bundle identifiers of known screenshot and screen-recording tools whose selection pickers
+    /// or crosshair overlays swallow ⌘C to copy images instead of text.
+    public static let screenCaptureBundleIDs: Set<String> = [
+        "com.cleanshot.app",
+        "pl.maketheweb.cleanshotx",
+        "cc.ffitch.shottr",
+        "com.macshot.app",
+        "com.TechSmith.Snagit",
+        "net.telestream.screenflow",
+        "com.wulkano.kap",
+        "com.x-art.Xnip",
+        "com.monosnap.monosnap",
+        "org.flameshot.flameshot",
+        "com.skillbrains.lightshot",
+        "com.apple.screencapture",
+        "com.apple.screencaptureui"
+    ]
+
     /// Whether `window` can own the key window that receives a synthetic ⌘C. Windows with no owning
-    /// application (the window server) and system chrome cannot, so they must never be treated as
-    /// copy-swallowing overlays.
+    /// application (the window server), system chrome, utility overlays, and extreme layer windows
+    /// (shields/hardware overlays) cannot, so they must never be treated as copy-swallowing overlays.
     static func canOwnKeyWindow(_ window: OnScreenWindowInfo) -> Bool {
         guard let bundleID = window.ownerBundleID else { return false }
-        return !systemChromeBundleIDs.contains(bundleID)
+        if systemChromeBundleIDs.contains(bundleID) { return false }
+        if utilityOverlayBundleIDs.contains(bundleID) { return false }
+        // Extreme layers (>= 1000) are screen shields, cursor/event tracking overlays, or screen savers;
+        // they can never own an app's key window for text selection.
+        if window.layer >= 1000 { return false }
+        return true
     }
 
     /// Pure decision over a front-to-back window list. Unknown inputs never suppress (fail open).
@@ -83,15 +118,28 @@ public enum CopyTriggerGate {
         displayBounds: CGRect? = nil
     ) -> Bool {
         // Without a known frontmost app or display there is nothing to reason about: fail open.
-        guard frontmostPID != nil, let displayBounds else { return false }
+        guard let frontmostPID, let displayBounds else { return false }
         // Only visible windows that can own the key window are candidates; system chrome and
         // invisible (alpha 0) helper windows are skipped.
         guard let top = windows.first(where: {
             $0.layer >= 0 && $0.alpha > 0 && $0.frame.contains(point) && Self.canOwnKeyWindow($0)
         }) else { return false }
         if top.ownerPID == selfPID { return false }   // our own popup is not a foreign overlay
+
         let coversDisplay = top.frame.width >= displayBounds.width - 1
             && top.frame.height >= displayBounds.height - 1
+
+        if top.ownerPID == frontmostPID {
+            // A capture tool can *activate itself* while its picker is up (CleanShot X reports as
+            // frontmost). Only suppress if the frontmost app is an actual screen capture tool whose
+            // picker is covering the display. Normal applications (Chrome, Ghostty, etc.) in fullscreen
+            // (layer 500) belong to the active user session and are never foreign overlays.
+            if let bundleID = top.ownerBundleID, screenCaptureBundleIDs.contains(bundleID) {
+                return top.layer > 0 && coversDisplay
+            }
+            return false
+        }
+
         if let bundleID = top.ownerBundleID, systemUIBundleIDs.contains(bundleID) && top.layer > 0 {
             // A System UI *panel* can swallow the copy even though it does not cover the display.
             // Its display-covering backdrop is a transparent click-catcher, not a panel: treating
