@@ -44,18 +44,6 @@ public enum CopyTriggerGate {
         "com.apple.wallpaper"
     ]
 
-    /// Bundle identifiers of utility tools (mouse helpers, dimmers, window managers, HUDs) that keep
-    /// full-screen or elevated tracking/display windows on screen. These helper windows are transparent
-    /// or non-interactive event taps that never receive or swallow a synthetic ⌘C.
-    public static let utilityOverlayBundleIDs: Set<String> = [
-        "com.nuebling.mac-mouse-fix",
-        "com.nuebling.mac-mouse-fix.helper",
-        "com.pointum.hazeover",
-        "com.stonerl.Thaw",
-        "iordv.Droppy",
-        "lo.cafe.NotchNook"
-    ]
-
     /// Bundle identifiers of system UI *panels* (Control Center, Notification Center, etc.) that
     /// float above applications. Interacting with these must never deliver synthetic copies to
     /// background applications. Their display-covering backdrops are excluded by
@@ -87,12 +75,11 @@ public enum CopyTriggerGate {
     ]
 
     /// Whether `window` can own the key window that receives a synthetic ⌘C. Windows with no owning
-    /// application (the window server), system chrome, utility overlays, and extreme layer windows
-    /// (shields/hardware overlays) cannot, so they must never be treated as copy-swallowing overlays.
+    /// application (the window server), system chrome, and extreme layer windows (shields/hardware
+    /// overlays) cannot, so they must never be treated as copy-swallowing overlays.
     static func canOwnKeyWindow(_ window: OnScreenWindowInfo) -> Bool {
         guard let bundleID = window.ownerBundleID else { return false }
         if systemChromeBundleIDs.contains(bundleID) { return false }
-        if utilityOverlayBundleIDs.contains(bundleID) { return false }
         // Extreme layers (>= 1000) are screen shields, cursor/event tracking overlays, or screen savers;
         // they can never own an app's key window for text selection.
         if window.layer >= 1000 { return false }
@@ -101,15 +88,15 @@ public enum CopyTriggerGate {
 
     /// Pure decision over a front-to-back window list. Unknown inputs never suppress (fail open).
     ///
-    /// The only window that can swallow the synthetic ⌘C is one that owns the key window: an
-    /// *elevated* window that *covers the display* — the profile of a capture/annotation tool's
-    /// full-screen picker, whether it belongs to another app or activates itself (CleanShot X) —
-    /// or an elevated System UI *panel* (Control Center, Notification Center).
-    /// Windows that merely float above the point at a smaller size — a notch/HUD app's panel
-    /// (NotchNook), a menu, a tooltip, an Electron helper window — never receive the copy, and
-    /// treating them as overlays silently dropped legitimate selections. System chrome (the Dock,
-    /// the window server) is likewise excluded by `canOwnKeyWindow`, and fully transparent helper
-    /// windows are excluded by `alpha`.
+    /// Only two categories of windows can swallow the synthetic ⌘C:
+    /// 1. A known screenshot/capture tool's full-screen picker (elevated, display-covering).
+    /// 2. An elevated System UI *panel* (Control Center, Notification Center) — its display-covering
+    ///    backdrop is a transparent click-catcher and does NOT suppress.
+    ///
+    /// Everything else — window managers, mouse utilities, dimmers, HUDs, notification badges,
+    /// helper windows — is assumed to not intercept ⌘C and fails open. The earlier approach of
+    /// suppressing for any elevated display-covering foreign window and allowlisting known-good
+    /// utilities was a whack-a-mole: every non-allowlisted utility silently dropped selections.
     public static func isForeignOverlay(
         windows: [OnScreenWindowInfo],
         at point: CGPoint,
@@ -145,6 +132,13 @@ public enum CopyTriggerGate {
             // Its display-covering backdrop is a transparent click-catcher, not a panel: treating
             // it as an overlay suppressed every copy on screen for as long as it was up.
             return !coversDisplay
+        }
+
+        // Only known screenshot/capture tools suppress: their full-screen pickers intercept ⌘C to
+        // copy an image. All other elevated windows (window managers, mouse utilities, dimmers, HUDs)
+        // never own key window and never swallow a copy shortcut, so they fail open.
+        guard let bundleID = top.ownerBundleID, screenCaptureBundleIDs.contains(bundleID) else {
+            return false
         }
         return top.layer > 0 && coversDisplay
     }
