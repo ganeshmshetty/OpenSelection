@@ -276,7 +276,13 @@ public struct SelectionRetrievalCoordinator: Sendable {
                 OpenSelectionLogging.log("coordinator: \(previous.rawValue) produced no text for \(bundleID); falling back to \(strategy.rawValue)")
             }
             if requireCopyEvidence {
-                if let evidence = Self.copyEvidence(strategy, target: target, cursor: cursor) {
+                if let evidence = Self.copyEvidence(
+                    strategy,
+                    target: target,
+                    cursor: cursor,
+                    bundleID: app.bundleIdentifier,
+                    isFallbackFromAX: index > 0
+                ) {
                     OpenSelectionLogging.log("coordinator: \(strategy.rawValue) permitted for \(bundleID); text-selection evidence=\(evidence)")
                 } else {
                     OpenSelectionLogging.log("coordinator: skipping \(strategy.rawValue) for \(bundleID); no text-selection evidence (cursor=\(cursor.rawValue))")
@@ -658,7 +664,9 @@ public struct SelectionRetrievalCoordinator: Sendable {
     static func copyEvidence(
         _ strategy: SelectionStrategy,
         target: AXElementInspector.Target,
-        cursor: CursorClass
+        cursor: CursorClass,
+        bundleID: String? = nil,
+        isFallbackFromAX: Bool = false
     ) -> String? {
         guard strategy == .keyboardCopy || strategy == .menuCopy else { return "not-a-copy-strategy" }
         if cursor == .beam { return "beam-cursor" }
@@ -677,6 +685,19 @@ public struct SelectionRetrievalCoordinator: Sendable {
         // selection is being made.
         if let role = target.role, textEvidenceRoles.contains(role) { return "ax-role:\(role)" }
         if let role = target.containedInRoles.first(where: textEvidenceRoles.contains) { return "ax-ancestor-role:\(role)" }
+
+        // Browser & PWA fallback (Issue #121): Chrome and Chromium PWAs don't expose AXWebArea without
+        // --force-renderer-accessibility and custom-draw their cursors (.unknown or .pointingHand over links).
+        // When cascading from a failed AX read in a browser, or when hovering over web content with a browser cursor,
+        // accept the copy strategy as justified.
+        if let bundleID, AppMatching.isBrowser(bundleID) {
+            if isFallbackFromAX {
+                return "ax-empty-browser-fallback"
+            }
+            if cursor == .unknown || cursor == .pointingHand {
+                return "browser-cursor:\(cursor.rawValue)"
+            }
+        }
         return nil
     }
 

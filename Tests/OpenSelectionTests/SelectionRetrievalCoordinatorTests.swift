@@ -1500,6 +1500,25 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
 
         XCTAssertNil(result, "Office script exceeding timeout must return nil")
     }
+
+    /// Regression (Issue #121): Chrome and Chromium PWAs do not expose AXWebArea text selections
+    /// without `--force-renderer-accessibility` and custom-render cursors (.unknown or .pointingHand over links).
+    /// When AXWebArea produces no text and cascades to keyboard-copy, the coordinator must allow
+    /// the copy fallback.
+    func testChromeEmptyWebAreaFallbackPermitsCopyForUnknownOrPointingHandCursor() async {
+        for cursor: CursorClass in [.unknown, .pointingHand] {
+            let coordinator = SelectionRetrievalCoordinator(
+                inspect: { Self.opaqueTarget(containedInRoles: ["AXWebArea"]) },
+                copyCapture: { _ in SelectionResult(text: "captured from chrome") }
+            )
+            let result = await coordinator.retrieve(
+                for: AppIdentity(bundleIdentifier: "com.google.Chrome"),
+                policy: AppPolicyContext(retrievalMode: .axWebArea),
+                cursor: cursor
+            )
+            XCTAssertEqual(result?.text, "captured from chrome", "cursor=\(cursor.rawValue) must allow copy fallback in browser")
+        }
+    }
 }
 
 private final class PressStartSignal: @unchecked Sendable {
