@@ -38,6 +38,66 @@ final class OpenSelectionMonitorTests: XCTestCase {
         XCTAssertFalse(OpenSelectionMonitor.isSelectionTrigger(keyCode: 0x00, flags: []))
     }
 
+    func testWindowMoveResizeOrCloseNeverRetrievesAnOldSelection() async {
+        let frame = CGRect(x: 100, y: 100, width: 500, height: 400)
+        let changedFrames: [CGRect?] = [frame.offsetBy(dx: 80, dy: 30),
+                                       CGRect(x: 100, y: 100, width: 600, height: 400), nil]
+        for changedFrame in changedFrames {
+            let monitor = OpenSelectionMonitor()
+            monitor.isSystemChrome = { _ in false }
+            monitor.windowAtPoint = { _ in SelectionGestureWindow(id: 123, frame: frame) }
+            monitor.windowFrame = { _ in changedFrame }
+            monitor.coordinator = SelectionRetrievalCoordinator(inspect: {
+                XCTFail("Window gestures must be rejected before retrieval")
+                return Self.textTarget(selectedText: "old selection")
+            }, copyCapture: { _ in
+                XCTFail("Window gestures must never attempt Copy")
+                return nil
+            })
+            monitor.handleMouseDown(at: CGPoint(x: 100, y: 100))
+            monitor.handleMouseUp(app: .current, cursor: CGPoint(x: 200, y: 150), clickCount: 1)
+            await monitor.debounceTask?.value
+            XCTAssertNil(monitor.debounceTask)
+        }
+    }
+
+    func testTextDragInStationaryWindowStillDelivers() async {
+        let monitor = OpenSelectionMonitor()
+        let frame = CGRect(x: 100, y: 100, width: 500, height: 400)
+        monitor.isSystemChrome = { _ in false }
+        monitor.windowAtPoint = { _ in SelectionGestureWindow(id: 123, frame: frame) }
+        monitor.windowFrame = { _ in frame }
+        monitor.currentCursorProvider = { .unknown }
+        monitor.coordinator = SelectionRetrievalCoordinator(inspect: { Self.textTarget() })
+        let box = ResultBox()
+        monitor.onSelection = { box.result = $0 }
+        monitor.handleMouseDown(at: CGPoint(x: 100, y: 100))
+        monitor.handleMouseUp(app: .current, cursor: CGPoint(x: 200, y: 150), clickCount: 1)
+        await monitor.debounceTask?.value
+        XCTAssertEqual(box.result?.text, "sample selection")
+    }
+
+    func testNewPressIncludingChromeCancelsPendingRetrieval() {
+        for chrome in [false, true] {
+            let monitor = OpenSelectionMonitor()
+            monitor.isSystemChrome = { _ in chrome }
+            let read = Task<Void, Never> { }
+            monitor.debounceTask = read
+            monitor.handleMouseDown(at: CGPoint(x: 100, y: 100))
+            XCTAssertTrue(read.isCancelled)
+            XCTAssertNil(monitor.debounceTask)
+        }
+    }
+
+    func testApplicationActivationCancelsPendingRetrieval() {
+        let monitor = OpenSelectionMonitor()
+        let read = Task<Void, Never> { }
+        monitor.debounceTask = read
+        monitor.cancelPendingSelection()
+        XCTAssertTrue(read.isCancelled)
+        XCTAssertNil(monitor.debounceTask)
+    }
+
     func testCommandLTriggersSelectionRetrieval() {
         XCTAssertTrue(OpenSelectionMonitor.isSelectionTrigger(keyCode: 0x25, flags: [.command]))
         XCTAssertTrue(OpenSelectionMonitor.isSelectAllKey(keyCode: 0x25, flags: [.command]))

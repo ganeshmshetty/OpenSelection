@@ -14,7 +14,7 @@ ZERO third-party dependencies — built entirely on Apple system frameworks (`Ap
   - `AXTextControlStrategy`: Direct zero-copy accessibility reads for native text fields (`AXTextField`, `AXTextArea`).
   - `AXWebAreaStrategy`: Text marker range inspection and bounded settle-retries for WebKit web content.
   - `menuCopy`: Non-invasive menu item traversal triggering `Edit ▸ Copy` via Accessibility.
-  - `keyboardCopy`: Synthetic ⌘C dispatch with pre-flight enablement checks, pasteboard snapshot archiving, and transient marker restoration.
+  - `keyboardCopy`: Synthetic ⌘C dispatch with pasteboard snapshot archiving and transient marker restoration. Passive monitoring adds menu-shortcut authorization before dispatch.
   - `officeScript`: AppleScript Object Model retrieval for Microsoft Office (Word, Excel, PowerPoint) avoiding clipboard pollution.
 - **Watchdog Deadlines & Concurrency Gating**:
   - All accessibility inspects run off the cooperative thread pool on a dedicated concurrent queue.
@@ -101,6 +101,36 @@ OpenSelection.logger = { message in
 }
 ```
 
+### Passive Monitoring
+
+`OpenSelectionMonitor` rejects mouse gestures whose initial window moved, resized or disappeared
+before release, and cancels pending reads on a new press or application activation. Its copy
+fallback uses `AutomaticCopyCapture`: an enabled Command-C menu shortcut must be available before
+it invokes Copy. Shortcut matching ignores translated titles and selectors. The AX menu walk
+runs off the main actor with a 150 ms aggregate deadline (or the configured `axReadTimeout`, if
+shorter), per-message timeouts and at most one probe in flight. Cancellation, the frontmost PID
+and the existing overlay guard are checked before copying. Logs include only the trigger/PID,
+never selection or clipboard contents.
+
+Applications with their own gesture monitor can use the same capture seam:
+
+```swift
+let coordinator = SelectionRetrievalCoordinator(copyCapture: { trigger in
+    await AutomaticCopyCapture.capture(trigger: trigger)
+})
+```
+
+`SelectionGestureWindow.at(_:)` accepts AppKit screen coordinates and captures a window ID/frame;
+compare its frame with `SelectionGestureWindow.currentFrame(for:)` on release. This filters
+window moves even when the focused editor still exposes an old selection. Missing initial
+window metadata leaves ordinary selection detection intact. A window moved away and back to
+exactly its original frame, or a custom control drag, is not classified by this geometry check.
+
+Passive copy fails closed when the shortcut cannot be verified. This does **not** add a mandatory
+menu pre-gate to `SelectionRetrievalCoordinator`, `PasteboardCopyEngine` or `OpenSelection.current()`:
+explicit requests keep their existing behavior for copy-only apps with incomplete AX menus.
+Clients that replace the monitor's `coordinator` also take responsibility for its copy policy.
+
 ---
 
 ## Retrieval Strategies Explained
@@ -111,7 +141,7 @@ OpenSelection.logger = { message in
 | `.axWebArea` | WebKit text marker ranges (`AXSelectedTextMarkerRange`) with settle retries | Safari, Mail web bodies, WebKit webviews |
 | `.officeScript` | AppleScript Object Model document selection extraction | Word, Excel, PowerPoint |
 | `.menuCopy` | Locates and presses `Edit ▸ Copy` via AX menu hierarchy | Apps with disabled keystroke taps or custom menus |
-| `.keyboardCopy` | Verifies `Edit ▸ Copy` enablement, archives pasteboard, fires ⌘C, captures result, restores pasteboard | Chromium, Electron (VS Code, Slack), Terminal, Ghostty |
+| `.keyboardCopy` | Archives pasteboard, fires ⌘C, captures result, restores pasteboard. The passive monitor additionally authorizes the enabled shortcut. | Chromium, Electron (VS Code, Slack), Terminal, Ghostty |
 
 ---
 

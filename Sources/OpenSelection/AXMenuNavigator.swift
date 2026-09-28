@@ -40,10 +40,12 @@ public struct AXMenuNavigator {
 
     /// Traverses the application menu bar to locate the requested menu command.
     /// Traversal is deadline-bounded and prioritizes inspecting the Edit menu first.
+    /// `matchingShortcutOnly` ignores titles/selectors when authorizing a synthetic shortcut.
     public static func findMenuItem(
         _ command: MenuCommand,
         in app: AXUIElement?,
         requireEnabled: Bool = false,
+        matchingShortcutOnly: Bool = false,
         timeout: TimeInterval = 0.5,
         deadline: Date? = nil
     ) -> AXUIElement? {
@@ -65,6 +67,7 @@ public struct AXMenuNavigator {
                command: command,
                root: topMenus[editMenuIndex],
                requireEnabled: requireEnabled,
+               matchingShortcutOnly: matchingShortcutOnly,
                timeout: timeout,
                deadline: deadline
            ) {
@@ -77,6 +80,7 @@ public struct AXMenuNavigator {
                 command: command,
                 root: menu,
                 requireEnabled: requireEnabled,
+                matchingShortcutOnly: matchingShortcutOnly,
                 timeout: timeout,
                 deadline: deadline
             ) {
@@ -109,8 +113,13 @@ public struct AXMenuNavigator {
         title: String?,
         identifier: String?,
         cmdChar: String?,
-        cmdModifiers: UInt?
+        cmdModifiers: UInt?,
+        matchingShortcutOnly: Bool = false
     ) -> Bool {
+        if matchingShortcutOnly {
+            // AX menu modifiers imply Command: 0 means Command alone.
+            return cmdChar?.caseInsensitiveCompare(command.cmdChar) == .orderedSame && cmdModifiers == 0
+        }
         if let identifier, identifier == command.identifier { return true }
 
         if let cmdChar, cmdChar.caseInsensitiveCompare(command.cmdChar) == .orderedSame,
@@ -137,6 +146,7 @@ public struct AXMenuNavigator {
         command: MenuCommand,
         root: AXUIElement,
         requireEnabled: Bool,
+        matchingShortcutOnly: Bool,
         currentDepth: Int = 0,
         timeout: TimeInterval,
         deadline: Date?
@@ -145,7 +155,7 @@ public struct AXMenuNavigator {
             return nil
         }
 
-        if elementMatches(command: command, element: root, requireEnabled: requireEnabled, timeout: timeout, deadline: deadline) {
+        if elementMatches(command: command, element: root, requireEnabled: requireEnabled, matchingShortcutOnly: matchingShortcutOnly, timeout: timeout, deadline: deadline) {
             return root
         }
 
@@ -156,6 +166,7 @@ public struct AXMenuNavigator {
                 command: command,
                 root: child,
                 requireEnabled: requireEnabled,
+                matchingShortcutOnly: matchingShortcutOnly,
                 currentDepth: currentDepth + 1,
                 timeout: timeout,
                 deadline: deadline
@@ -172,6 +183,7 @@ public struct AXMenuNavigator {
         command: MenuCommand,
         element: AXUIElement,
         requireEnabled: Bool,
+        matchingShortcutOnly: Bool,
         timeout: TimeInterval,
         deadline: Date?
     ) -> Bool {
@@ -187,7 +199,8 @@ public struct AXMenuNavigator {
             title: title,
             identifier: identifier,
             cmdChar: cmdChar,
-            cmdModifiers: rawModifiers?.uintValue
+            cmdModifiers: rawModifiers?.uintValue,
+            matchingShortcutOnly: matchingShortcutOnly
         ) else {
             return false
         }
