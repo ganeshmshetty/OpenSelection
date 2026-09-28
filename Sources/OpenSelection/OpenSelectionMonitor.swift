@@ -46,9 +46,11 @@ public final class OpenSelectionMonitor {
     private var mouseDownMonitor: Any?
     private var mouseDragMonitor: Any?
     private var keyDownMonitor: Any?
+    private var appActivationObserver: NSObjectProtocol?
 
     internal var debounceTask: Task<Void, Never>?
     internal var mouseDownLocation: CGPoint?
+    private var mouseDownWindow: SelectionGestureWindow?
     /// Whether the press that started the current gesture landed on system chrome. Gate on this
     /// (the press), not on where the pointer is released: a drag that begins in a window and
     /// overshoots onto the menu bar or Dock is still a selection, while one that begins on chrome is not.
@@ -65,6 +67,8 @@ public final class OpenSelectionMonitor {
     /// Whether `point` sits on on-screen system chrome (the menu bar or Dock). Injectable so the
     /// gesture logic can be exercised headlessly against a fixed geometry.
     public var isSystemChrome: @MainActor (CGPoint) -> Bool = { OpenSelectionMonitor.isSystemChromeLocation($0) }
+    internal var windowAtPoint: @MainActor (CGPoint) -> SelectionGestureWindow? = { SelectionGestureWindow.at($0) }
+    internal var windowFrame: @MainActor (CGWindowID) -> CGRect? = { SelectionGestureWindow.currentFrame(for: $0) }
 
     public var coordinator: SelectionRetrievalCoordinator
 
@@ -91,7 +95,9 @@ public final class OpenSelectionMonitor {
         self.configuration = configuration
         self.excludedBundleIDs = excludedBundleIDs
         self.onSelection = onSelection
-        self.coordinator = SelectionRetrievalCoordinator(configuration: configuration)
+        self.coordinator = SelectionRetrievalCoordinator(configuration: configuration, copyCapture: { trigger in
+            await AutomaticCopyCapture.capture(configuration: configuration, trigger: trigger)
+        })
     }
 
     deinit {
@@ -108,6 +114,12 @@ public final class OpenSelectionMonitor {
 
     public func start() {
         guard monitor == nil else { return }
+
+        appActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.cancelPendingSelection() }
+        }
 
         mouseDownMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] _ in
             let point = NSEvent.mouseLocation
@@ -146,8 +158,12 @@ public final class OpenSelectionMonitor {
     }
 
     public func stop() {
-        debounceTask?.cancel()
-        debounceTask = nil
+        cancelPendingSelection()
+        mouseDownWindow = nil
+        if let appActivationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(appActivationObserver)
+            self.appActivationObserver = nil
+        }
         if let monitor {
             NSEvent.removeMonitor(monitor)
             self.monitor = nil
@@ -253,7 +269,14 @@ public final class OpenSelectionMonitor {
 
     // MARK: - Event Handlers
 
+    internal func cancelPendingSelection() {
+        debounceTask?.cancel()
+        debounceTask = nil
+    }
+
     public func handleMouseDown(at point: CGPoint) {
+        cancelPendingSelection()
+        mouseDownWindow = nil
         if isSystemChrome(point) {
             mouseDownLocation = nil
             mouseDownWasSystemChrome = true
@@ -261,6 +284,7 @@ public final class OpenSelectionMonitor {
         }
         mouseDownWasSystemChrome = false
         mouseDownLocation = point
+        mouseDownWindow = windowAtPoint(point)
     }
 
     public func handleMouseDragged(at point: CGPoint) {
@@ -268,6 +292,15 @@ public final class OpenSelectionMonitor {
     }
 
     public func handleMouseUp(app: NSRunningApplication, cursor: CGPoint, clickCount: Int) {
+        let gestureWindow = mouseDownWindow
+        mouseDownWindow = nil
+        if let gestureWindow, windowFrame(gestureWindow.id) != gestureWindow.frame {
+            cancelPendingSelection()
+            mouseDownLocation = nil
+            mouseDownWasSystemChrome = false
+            OpenSelectionLogging.log("monitor: skipped window move or resize")
+            return
+        }
         let wasSystemChrome = mouseDownWasSystemChrome
         mouseDownWasSystemChrome = false
 
@@ -298,7 +331,7 @@ public final class OpenSelectionMonitor {
         guard isDragOrMultiClick else { return }
 
         debounceTask = Task { @MainActor in
-            guard !self.isSuppressed(), !self.isSuppressedForApp(app.bundleIdentifier) else { return }
+            guard !Task.isCancelled, !self.isSuppressed(), !self.isSuppressedForApp(app.bundleIdentifier) else { return }
             if let bundleID = app.bundleIdentifier, self.excludedBundleIDs.contains(bundleID) { return }
 
             let appIdentity = AppIdentity(app)
