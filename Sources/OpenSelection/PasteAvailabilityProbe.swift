@@ -76,7 +76,7 @@ public struct PasteAvailabilityProbe: Sendable {
 
     public nonisolated func probePaste(pid: pid_t) async -> Bool? {
         guard await Self.probeGate.tryAcquire(limit: maxConcurrent) else {
-            OpenSelectionLogging.log("PasteAvailabilityProbe: concurrency cap reached for pid \(pid); reporting unknown")
+            DiagnosticsHub.shared.log(.warning, .pasteboard, "paste probe concurrency cap reached", fields: ["pid": .int(Int64(pid))])
             return nil
         }
         let lookup = self.lookup
@@ -90,7 +90,10 @@ public struct PasteAvailabilityProbe: Sendable {
                 try? await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
                 if resume.resume(continuation, with: nil) {
                     Task.detached { await Self.probeGate.release() }
-                    OpenSelectionLogging.log("PasteAvailabilityProbe: lookup for pid \(pid) exceeded \(timeoutSeconds)s deadline; reporting unknown")
+                    DiagnosticsHub.shared.log(.warning, .pasteboard, "paste probe lookup deadline exceeded", fields: [
+                        "pid": .int(Int64(pid)),
+                        "timeoutMicros": .micros(UInt32(timeoutSeconds * 1_000_000))
+                    ])
                 }
             })
 

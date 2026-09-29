@@ -38,7 +38,7 @@ public struct PasteboardCopyEngine {
         // Refuse before posting anything: a key window owned by another app means the synthetic ⌘C
         // would fire that overlay's shortcut and tear it down instead of reaching the target app.
         guard isCopyAuthorized() else {
-            OpenSelectionLogging.log("copy engine: suppressed — a foreign overlay owns the key window")
+            DiagnosticsHub.shared.log(.debug, .pasteboard, "copy engine suppressed, foreign overlay owns key window")
             return nil
         }
 
@@ -114,7 +114,7 @@ public struct PasteboardCopyEngine {
                     // and bailing out would leave it there in place of the user's clipboard. A user copy
                     // that really landed advanced the changeCount and takes the bail-out instead.
                     guard pasteboard.changeCount == observedCopyCount else {
-                        OpenSelectionLogging.log("copy engine: external copy detected — leaving clipboard untouched")
+                        DiagnosticsHub.shared.log(.debug, .pasteboard, "copy engine external copy detected, leaving clipboard untouched")
                         return nil
                     }
 
@@ -146,7 +146,7 @@ public struct PasteboardCopyEngine {
             let userCopyLanded = userCopied.withLock({ $0 })
                 && !Self.shouldRestoreAfterUserCopy(changeCount: changeCount, postCopyCount: postCopyCount)
             if changeCount != initialChangeCount, !userCopyLanded {
-                OpenSelectionLogging.log("copy engine: no non-empty pasteboard text within deadline; restoring immediately")
+                DiagnosticsHub.shared.log(.debug, .pasteboard, "copy engine found no text within deadline, restoring snapshot")
                 snapshot.restore(to: pasteboard, transientMarkers: true)
             }
             return nil
@@ -179,11 +179,11 @@ public struct PasteboardCopyEngine {
         pasteboard: NSPasteboard
     ) -> Bool {
         guard shouldRestoreAfterUserCopy(changeCount: changeCount, postCopyCount: postCopyCount) else {
-            OpenSelectionLogging.log("copy engine: user copied during grab — leaving clipboard untouched")
+            DiagnosticsHub.shared.log(.debug, .pasteboard, "copy engine user copied during grab, leaving clipboard untouched")
             return false
         }
         snapshot.restore(to: pasteboard, transientMarkers: true)
-        OpenSelectionLogging.log("copy engine: user copy wrote nothing to the pasteboard; restored the snapshot over our stale synthetic copy")
+        DiagnosticsHub.shared.log(.debug, .pasteboard, "copy engine user copy wrote nothing, restored snapshot over stale copy")
         return true
     }
 

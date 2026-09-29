@@ -17,6 +17,14 @@ public typealias OpenSelectionCoordinator = SelectionRetrievalCoordinator
 public typealias OpenSelectionReplacer = SelectionReplacer
 public typealias OpenSelectionMonitorType = OpenSelectionMonitor
 public typealias OpenSelectionPasteAvailabilityProbe = PasteAvailabilityProbe
+public typealias DiagnosticsLogLevel = LogLevel
+public typealias DiagnosticsLogCategory = LogCategory
+public typealias DiagnosticsFieldValue = FieldValue
+public typealias DiagnosticsEvent = DiagnosticEvent
+public typealias DiagnosticsCascadeReport = CascadeReport
+public typealias DiagnosticsTraceID = TraceID
+public typealias DiagnosticsTriggerSource = TriggerSource
+public typealias DiagnosticsSelectionTrace = SelectionTrace
 
 public enum OpenSelection: Sendable {
     public typealias CursorClass = OpenSelectionCursorClass
@@ -39,6 +47,15 @@ public enum OpenSelection: Sendable {
     public typealias OpenSelectionMonitor = OpenSelectionMonitorType
     public typealias PasteProbe = OpenSelectionPasteAvailabilityProbe
     public typealias PasteAvailabilityProbe = OpenSelectionPasteAvailabilityProbe
+    public typealias LogLevel = DiagnosticsLogLevel
+    public typealias LogCategory = DiagnosticsLogCategory
+    public typealias FieldValue = DiagnosticsFieldValue
+    public typealias DiagnosticEvent = DiagnosticsEvent
+    public typealias CascadeReport = DiagnosticsCascadeReport
+    public typealias DiagnosticsSink = OpenSelectionDiagnosticsSink
+    public typealias TraceID = DiagnosticsTraceID
+    public typealias TriggerSource = DiagnosticsTriggerSource
+    public typealias SelectionTrace = DiagnosticsSelectionTrace
 
     private static let configLock = OSAllocatedUnfairLock(initialState: SelectionConfiguration.default)
 
@@ -86,7 +103,8 @@ public enum OpenSelection: Sendable {
         cursor: CursorClass = .unknown,
         configuration: SelectionConfiguration? = nil,
         isSelectAll: Bool = false,
-        allowCopyFallback: Bool = true
+        allowCopyFallback: Bool = true,
+        trace: SelectionTrace? = nil
     ) async -> SelectionResult? {
         let config = configuration ?? Self.configuration
         let coordinator = SelectionRetrievalCoordinator(configuration: config)
@@ -95,7 +113,8 @@ public enum OpenSelection: Sendable {
             policy: policy,
             cursor: cursor,
             isSelectAll: isSelectAll,
-            allowCopyFallback: allowCopyFallback
+            allowCopyFallback: allowCopyFallback,
+            trace: trace
         )
     }
 
@@ -106,7 +125,8 @@ public enum OpenSelection: Sendable {
         cursor: CursorClass = .unknown,
         configuration: SelectionConfiguration? = nil,
         isSelectAll: Bool = false,
-        allowCopyFallback: Bool = true
+        allowCopyFallback: Bool = true,
+        trace: SelectionTrace? = nil
     ) async -> SelectionResult? {
         await retrieve(
             for: AppIdentity(app),
@@ -114,7 +134,8 @@ public enum OpenSelection: Sendable {
             cursor: cursor,
             configuration: configuration,
             isSelectAll: isSelectAll,
-            allowCopyFallback: allowCopyFallback
+            allowCopyFallback: allowCopyFallback,
+            trace: trace
         )
     }
 
@@ -125,7 +146,8 @@ public enum OpenSelection: Sendable {
         cursor: CursorClass = .unknown,
         configuration: SelectionConfiguration? = nil,
         isSelectAll: Bool = false,
-        allowCopyFallback: Bool = true
+        allowCopyFallback: Bool = true,
+        trace: SelectionTrace? = nil
     ) async -> (result: SelectionResult?, isEditable: Bool) {
         let config = configuration ?? Self.configuration
         let coordinator = SelectionRetrievalCoordinator(configuration: config)
@@ -134,7 +156,8 @@ public enum OpenSelection: Sendable {
             policy: policy,
             cursor: cursor,
             isSelectAll: isSelectAll,
-            allowCopyFallback: allowCopyFallback
+            allowCopyFallback: allowCopyFallback,
+            trace: trace
         )
     }
 
@@ -145,7 +168,8 @@ public enum OpenSelection: Sendable {
         cursor: CursorClass = .unknown,
         configuration: SelectionConfiguration? = nil,
         isSelectAll: Bool = false,
-        allowCopyFallback: Bool = true
+        allowCopyFallback: Bool = true,
+        trace: SelectionTrace? = nil
     ) async -> (result: SelectionResult?, isEditable: Bool) {
         await retrieveDetails(
             for: AppIdentity(app),
@@ -153,7 +177,8 @@ public enum OpenSelection: Sendable {
             cursor: cursor,
             configuration: configuration,
             isSelectAll: isSelectAll,
-            allowCopyFallback: allowCopyFallback
+            allowCopyFallback: allowCopyFallback,
+            trace: trace
         )
     }
 
