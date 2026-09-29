@@ -161,12 +161,12 @@ public enum CopyTriggerGate {
         // user's log dump instead of being an invisible "no selection".
         if suppressed {
             let top = windows.first { $0.layer >= 0 && $0.alpha > 0 && $0.frame.contains(point) }
-            let topDescription = top.map {
-                "owner=\($0.ownerPID) layer=\($0.layer) alpha=\($0.alpha) frame=(\(Int($0.frame.minX)),\(Int($0.frame.minY))) \(Int($0.frame.width))x\(Int($0.frame.height))"
-            } ?? "none"
-            OpenSelectionLogging.log(
-                "copy gate: suppressed at (\(Int(point.x)),\(Int(point.y))) — frontmost=\(frontmostPID.map(String.init) ?? "nil") self=\(ProcessInfo.processInfo.processIdentifier) top[\(topDescription)]"
-            )
+            DiagnosticsHub.shared.log(.info, .gate, "copy gate suppressed by foreign overlay", fields: [
+                "frontmostPID": .int(Int64(frontmostPID ?? -1)),
+                "selfPID": .int(Int64(ProcessInfo.processInfo.processIdentifier)),
+                "topPID": .int(Int64(top?.ownerPID ?? -1)),
+                "topLayer": .int(Int64(top?.layer ?? -1))
+            ])
         }
         return suppressed
     }

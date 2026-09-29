@@ -91,14 +91,15 @@ public struct AXElementInspector {
     /// system-wide element, and the focused UI element is then read from THAT application
     /// element. Reading `kAXFocusedUIElementAttribute` directly off the system-wide element
     /// is the classic source of stale or missing selection reads.
-    public static func inspect(ancestorDepth: Int = ancestorWalkDepth) -> Target {
+    public static func inspect(ancestorDepth: Int = ancestorWalkDepth, trace: SelectionTrace? = nil) -> Target {
+        trace?.log(.debug, .ax, "ax inspect started")
         let systemWide = AXUIElementCreateSystemWide()
 
         // 1. Focused application — from the system-wide element.
-        let focusedApp = read(systemWide, kAXFocusedApplicationAttribute).flatMap { axElement($0) }
+        let focusedApp = read(systemWide, kAXFocusedApplicationAttribute, trace: trace).flatMap { axElement($0) }
 
         // 2. Focused UI element — from the focused application element, never system-wide.
-        let focusedElement = focusedApp.flatMap { axElement(read($0, kAXFocusedUIElementAttribute)) }
+        let focusedElement = focusedApp.flatMap { axElement(read($0, kAXFocusedUIElementAttribute, trace: trace)) }
 
         var role: String?
         var subRole: String?
@@ -235,11 +236,31 @@ public struct AXElementInspector {
         return nil
     }
 
-    /// Reads a single AX attribute, returning `nil` on any error or unsupported attribute.
-    public static func read(_ element: AXUIElement, _ attribute: String) -> CFTypeRef? {
+    /// Reads a single AX attribute, returning an `AXReadResult` containing either the value
+    /// or the unmasked `AXErrorCode`.
+    public static func readResult(
+        _ element: AXUIElement,
+        _ attribute: String,
+        trace: SelectionTrace? = nil
+    ) -> AXReadResult<CFTypeRef> {
         var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else { return nil }
-        return value
+        let err = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
+        if err == .success, let value {
+            return .value(value)
+        }
+        let code = AXErrorCode(axError: err)
+        if let trace, code != .noValue, code != .attributeUnsupported {
+            trace.log(.trace, .ax, "ax attribute read failed", fields: [
+                "attribute": .token(attribute),
+                "error": .ax(code)
+            ])
+        }
+        return .failure(code)
+    }
+
+    /// Reads a single AX attribute, returning `nil` on any error or unsupported attribute.
+    public static func read(_ element: AXUIElement, _ attribute: String, trace: SelectionTrace? = nil) -> CFTypeRef? {
+        readResult(element, attribute, trace: trace).valueOrNil
     }
 
     /// Returns the value as an `AXUIElement` only when it actually is one.

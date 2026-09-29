@@ -10,15 +10,19 @@ final class AutomaticCopyCaptureTests: XCTestCase {
         return board
     }
 
-    func testUnavailableCopyDoesNotTriggerOrTouchClipboard() async {
+    func testDisabledMenuWithWeakEvidenceDoesNotTriggerOrTouchClipboard() async {
         let board = pasteboard()
         defer { board.releaseGlobally() }
         let changeCount = board.changeCount
+        let request = CopyRequest(
+            trigger: { XCTFail("A disabled Copy command with weak evidence must never be triggered") },
+            evidence: CopyEvidence("test-weak", .weak)
+        )
         let result = await AutomaticCopyCapture.capture(
-            trigger: { XCTFail("An unavailable Copy command must never be triggered") },
+            request: request,
             pasteboard: board,
             frontmostPID: { 42 },
-            copyAvailable: { _ in false },
+            menuState: { _ in .disabled },
             overlayPresent: { false }
         )
         XCTAssertNil(result)
@@ -26,22 +30,77 @@ final class AutomaticCopyCaptureTests: XCTestCase {
         XCTAssertEqual(board.string(forType: .string), "Original clipboard")
     }
 
-    func testEnabledCopyCapturesAndRestoresClipboard() async {
+    func testStrongEvidenceProceedsEvenIfMenuIsDisabled() async {
         let board = pasteboard()
         defer { board.releaseGlobally() }
         var triggers = 0
-        let result = await AutomaticCopyCapture.capture(
+        let request = CopyRequest(
             trigger: {
                 triggers += 1
                 board.clearContents()
                 board.setString("Selected text", forType: .string)
             },
+            evidence: CopyEvidence("test-strong", .strong)
+        )
+        let result = await AutomaticCopyCapture.capture(
+            request: request,
             pasteboard: board,
             frontmostPID: { 42 },
-            copyAvailable: { pid in
-                XCTAssertEqual(pid, 42)
-                return true
+            menuState: { _ in
+                XCTFail("Menu probe must NOT be consulted for strong evidence")
+                return .disabled
             },
+            overlayPresent: { false }
+        )
+        XCTAssertEqual(triggers, 1)
+        XCTAssertEqual(result?.text, "Selected text")
+        XCTAssertEqual(board.string(forType: .string), "Original clipboard")
+    }
+
+    func testEnabledMenuCapturesAndRestoresClipboard() async {
+        let board = pasteboard()
+        defer { board.releaseGlobally() }
+        var triggers = 0
+        let request = CopyRequest(
+            trigger: {
+                triggers += 1
+                board.clearContents()
+                board.setString("Selected text", forType: .string)
+            },
+            evidence: CopyEvidence("test-weak", .weak)
+        )
+        let result = await AutomaticCopyCapture.capture(
+            request: request,
+            pasteboard: board,
+            frontmostPID: { 42 },
+            menuState: { pid in
+                XCTAssertEqual(pid, 42)
+                return .enabled
+            },
+            overlayPresent: { false }
+        )
+        XCTAssertEqual(triggers, 1)
+        XCTAssertEqual(result?.text, "Selected text")
+        XCTAssertEqual(board.string(forType: .string), "Original clipboard")
+    }
+
+    func testUnknownMenuStateAllowsCopyWithWeakEvidence() async {
+        let board = pasteboard()
+        defer { board.releaseGlobally() }
+        var triggers = 0
+        let request = CopyRequest(
+            trigger: {
+                triggers += 1
+                board.clearContents()
+                board.setString("Selected text", forType: .string)
+            },
+            evidence: CopyEvidence("test-weak", .weak)
+        )
+        let result = await AutomaticCopyCapture.capture(
+            request: request,
+            pasteboard: board,
+            frontmostPID: { 42 },
+            menuState: { _ in .unknown(.timeout) },
             overlayPresent: { false }
         )
         XCTAssertEqual(triggers, 1)
@@ -54,13 +113,17 @@ final class AutomaticCopyCaptureTests: XCTestCase {
         defer { board.releaseGlobally() }
         let changeCount = board.changeCount
         var pid: pid_t = 42
-        let result = await AutomaticCopyCapture.capture(
+        let request = CopyRequest(
             trigger: { XCTFail("The old gesture must not send Copy to the new app") },
+            evidence: CopyEvidence("test-weak", .weak)
+        )
+        let result = await AutomaticCopyCapture.capture(
+            request: request,
             pasteboard: board,
             frontmostPID: { pid },
-            copyAvailable: { _ in
+            menuState: { _ in
                 pid = 43
-                return true
+                return .enabled
             },
             overlayPresent: { false }
         )
@@ -73,13 +136,17 @@ final class AutomaticCopyCaptureTests: XCTestCase {
         defer { board.releaseGlobally() }
         let changeCount = board.changeCount
         let task = Task { @MainActor in
-            await AutomaticCopyCapture.capture(
+            let request = CopyRequest(
                 trigger: { XCTFail("A cancelled gesture must not trigger Copy") },
+                evidence: CopyEvidence("test-weak", .weak)
+            )
+            return await AutomaticCopyCapture.capture(
+                request: request,
                 pasteboard: board,
                 frontmostPID: { 42 },
-                copyAvailable: { _ in
+                menuState: { _ in
                     withUnsafeCurrentTask { $0?.cancel() }
-                    return true
+                    return .enabled
                 },
                 overlayPresent: { false }
             )
@@ -93,11 +160,15 @@ final class AutomaticCopyCaptureTests: XCTestCase {
         let board = pasteboard()
         defer { board.releaseGlobally() }
         let changeCount = board.changeCount
-        let result = await AutomaticCopyCapture.capture(
+        let request = CopyRequest(
             trigger: { XCTFail("An overlay must not receive the copy shortcut") },
+            evidence: CopyEvidence("test-weak", .weak)
+        )
+        let result = await AutomaticCopyCapture.capture(
+            request: request,
             pasteboard: board,
             frontmostPID: { 42 },
-            copyAvailable: { _ in true },
+            menuState: { _ in .enabled },
             overlayPresent: { true }
         )
         XCTAssertNil(result)

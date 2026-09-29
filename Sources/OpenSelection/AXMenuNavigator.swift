@@ -7,6 +7,15 @@
 import ApplicationServices
 import Foundation
 
+public enum MenuProbeOutcome: @unchecked Sendable {
+    case found(AXUIElement, isEnabled: Bool?)
+    case notFound, noMenuBar, timedOut
+}
+
+public enum EnabledRead: Sendable, Equatable {
+    case value(Bool), invalidElement, failed
+}
+
 public struct AXMenuNavigator {
     /// The system menu commands to locate and press.
     public enum MenuCommand: CaseIterable, Sendable {
@@ -253,6 +262,115 @@ public struct AXMenuNavigator {
             return nil
         }
         return valueRef
+    }
+
+    // MARK: - Probing & Snapshotting
+
+    nonisolated(unsafe) private static let snapshotAttributes: [CFString] = [
+        kAXTitleAttribute as CFString,
+        kAXIdentifierAttribute as CFString,
+        kAXMenuItemCmdCharAttribute as CFString,
+        kAXMenuItemCmdModifiersAttribute as CFString,
+        kAXEnabledAttribute as CFString,
+    ]
+
+    private static func snapshot(
+        of element: AXUIElement,
+        timeout: TimeInterval,
+        deadline: Date
+    ) -> (title: String?, id: String?, cmdChar: String?, mods: UInt?, enabled: Bool?)? {
+        guard !isDeadlineExpired(deadline) else { return nil }
+        AXUIElementSetMessagingTimeout(element, Float(timeout))
+        var out: CFArray?
+        guard AXUIElementCopyMultipleAttributeValues(
+            element,
+            snapshotAttributes as CFArray,
+            AXCopyMultipleAttributeOptions(rawValue: 0),
+            &out
+        ) == .success,
+        let v = out as? [Any],
+        v.count == snapshotAttributes.count else { return nil }
+
+        let enabled: Bool?
+        if let b = v[4] as? Bool {
+            enabled = b
+        } else if let num = v[4] as? NSNumber {
+            enabled = num.boolValue
+        } else {
+            enabled = nil
+        }
+
+        return (
+            v[0] as? String,
+            v[1] as? String,
+            v[2] as? String,
+            (v[3] as? NSNumber)?.uintValue,
+            enabled
+        )
+    }
+
+    public static func probeMenuItem(
+        _ command: MenuCommand,
+        in app: AXUIElement,
+        matchingShortcutOnly: Bool,
+        timeout: TimeInterval,
+        deadline: Date
+    ) -> MenuProbeOutcome {
+        AXUIElementSetMessagingTimeout(app, Float(timeout))
+        guard let menuBar = queryElementAttribute(kAXMenuBarAttribute as CFString, of: app, timeout: timeout, deadline: deadline),
+              let top: [AXUIElement] = queryAttribute(kAXChildrenAttribute as CFString, of: menuBar, timeout: timeout, deadline: deadline)
+        else { return isDeadlineExpired(deadline) ? .timedOut : .noMenuBar }
+
+        let editIndex = 3
+        let order = top.indices.filter { $0 == editIndex } + top.indices.filter { $0 != editIndex }
+        for i in order {
+            if isDeadlineExpired(deadline) { return .timedOut }
+            if let hit = probeSubtree(command, top[i], matchingShortcutOnly, 0, timeout, deadline) {
+                return .found(hit.0, isEnabled: hit.1)
+            }
+        }
+        return isDeadlineExpired(deadline) ? .timedOut : .notFound
+    }
+
+    private static func probeSubtree(
+        _ command: MenuCommand,
+        _ root: AXUIElement,
+        _ shortcutOnly: Bool,
+        _ depth: Int,
+        _ timeout: TimeInterval,
+        _ deadline: Date
+    ) -> (AXUIElement, Bool?)? {
+        guard !isDeadlineExpired(deadline), depth <= maxTraversalDepth else { return nil }
+        if let s = snapshot(of: root, timeout: timeout, deadline: deadline),
+           matches(command, title: s.title, identifier: s.id, cmdChar: s.cmdChar,
+                   cmdModifiers: s.mods, matchingShortcutOnly: shortcutOnly) {
+            return (root, s.enabled)
+        }
+        let kids: [AXUIElement]? = queryAttribute(kAXChildrenAttribute as CFString, of: root, timeout: timeout, deadline: deadline)
+        for kid in kids ?? [] {
+            if let hit = probeSubtree(command, kid, shortcutOnly, depth + 1, timeout, deadline) { return hit }
+        }
+        return nil
+    }
+
+    /// Warm path: one IPC.
+    public static func readEnabled(of element: AXUIElement, timeout: TimeInterval) -> EnabledRead {
+        AXUIElementSetMessagingTimeout(element, Float(timeout))
+        var ref: CFTypeRef?
+        switch AXUIElementCopyAttributeValue(element, kAXEnabledAttribute as CFString, &ref) {
+        case .success:
+            if let b = ref as? Bool {
+                return .value(b)
+            } else if let num = ref as? NSNumber {
+                return .value(num.boolValue)
+            } else {
+                return .failed
+            }
+        case .invalidUIElement:
+            return .invalidElement
+        default:
+            return .failed
+        }
     }
 
     // MARK: - Localized titles

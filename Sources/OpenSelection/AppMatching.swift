@@ -115,6 +115,22 @@ public enum AppMatching: Sendable {
         return microsoftOfficeGroup.contains(bundleID)
     }
 
+    public static let terminalGroup: [String] = [
+        "com.apple.Terminal",
+        "com.googlecode.iterm2",
+        "dev.warp.Warp-Gnome",
+        "dev.warp.Warp",
+        "co.zeit.hyper",
+        "io.alacritty",
+        "net.kovidgoyal.kitty",
+        "com.mitchellh.ghostty"
+    ]
+
+    public static func isTerminal(_ bundleID: String?) -> Bool {
+        guard let bundleID else { return false }
+        return matchesAny(terminalGroup, bundleID: bundleID)
+    }
+
     /// Apps whose AX tree never exposes a text selection, so the only way to read them is to post a
     /// synthetic copy. The copy-evidence gate is waived for these: with no cursor class, no
     /// `AXSelectedText`/range, and no text-control role in the snapshot, the gate would skip the

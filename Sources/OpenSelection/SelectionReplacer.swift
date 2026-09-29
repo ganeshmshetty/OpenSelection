@@ -65,7 +65,7 @@ public struct SelectionReplacer {
         if status == .success && isSettable.boolValue {
             let setResult = AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFTypeRef)
             if setResult == .success {
-                OpenSelectionLogging.log("SelectionReplacer: successfully set kAXSelectedTextAttribute directly")
+                DiagnosticsHub.shared.log(.debug, .ax, "selection replacer set kAXSelectedTextAttribute directly")
                 return true
             }
         }
@@ -146,9 +146,9 @@ public struct SelectionReplacer {
                 try? await Task.sleep(nanoseconds: UInt64(restoreDelay * 1_000_000_000))
                 if pasteboard.changeCount == changeCountAfterWrite {
                     snapshot?.restore(to: pasteboard, transientMarkers: true)
-                    OpenSelectionLogging.log("SelectionReplacer: restored original pasteboard contents")
+                    DiagnosticsHub.shared.log(.debug, .pasteboard, "selection replacer restored original pasteboard contents")
                 } else {
-                    OpenSelectionLogging.log("SelectionReplacer: pasteboard was mutated during delivery; skipping restore")
+                    DiagnosticsHub.shared.log(.debug, .pasteboard, "selection replacer pasteboard mutated during delivery, skipping restore")
                 }
             }
         }

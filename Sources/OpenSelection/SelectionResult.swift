@@ -34,6 +34,9 @@ public struct SelectionResult: Sendable, Equatable {
     /// Whether the selection was made inside an editable text context (e.g. text field, text area).
     public let isEditable: Bool
 
+    /// Optional diagnostics report detailing the strategy evaluation cascade.
+    public let diagnostics: CascadeReport?
+
     public init(
         text: String,
         bounds: CGRect? = nil,
@@ -42,7 +45,8 @@ public struct SelectionResult: Sendable, Equatable {
         flavors: [PasteboardFlavor] = [],
         sourceApp: NSRunningApplication? = nil,
         strategy: SelectionStrategy = .axTextControl,
-        isEditable: Bool = false
+        isEditable: Bool = false,
+        diagnostics: CascadeReport? = nil
     ) {
         self.text = text
         self.bounds = bounds
@@ -52,6 +56,21 @@ public struct SelectionResult: Sendable, Equatable {
         self.sourceApp = sourceApp
         self.strategy = strategy
         self.isEditable = isEditable
+        self.diagnostics = diagnostics
+    }
+
+    public func withDiagnostics(_ report: CascadeReport) -> SelectionResult {
+        SelectionResult(
+            text: text,
+            bounds: bounds,
+            html: html,
+            rtf: rtf,
+            flavors: flavors,
+            sourceApp: sourceApp,
+            strategy: strategy,
+            isEditable: isEditable,
+            diagnostics: report
+        )
     }
 
     /// Layout-accurate plain text.

@@ -95,8 +95,8 @@ public final class OpenSelectionMonitor {
         self.configuration = configuration
         self.excludedBundleIDs = excludedBundleIDs
         self.onSelection = onSelection
-        self.coordinator = SelectionRetrievalCoordinator(configuration: configuration, copyCapture: { trigger in
-            await AutomaticCopyCapture.capture(configuration: configuration, trigger: trigger)
+        self.coordinator = SelectionRetrievalCoordinator(configuration: configuration, copyCapture: { request in
+            await AutomaticCopyCapture.capture(configuration: configuration, request: request)
         })
     }
 
@@ -298,7 +298,7 @@ public final class OpenSelectionMonitor {
             cancelPendingSelection()
             mouseDownLocation = nil
             mouseDownWasSystemChrome = false
-            OpenSelectionLogging.log("monitor: skipped window move or resize")
+            DiagnosticsHub.shared.log(.debug, .monitor, "monitor skipped window move or resize")
             return
         }
         let wasSystemChrome = mouseDownWasSystemChrome
