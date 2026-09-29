@@ -9,6 +9,7 @@ import os
 public enum OpenSelectionLogging: Sendable {
     private static let defaultLogger = Logger(subsystem: "com.openselection", category: "retrieval")
     private static let customLoggerLock = OSAllocatedUnfairLock<(@Sendable (String) -> Void)?>(initialState: nil)
+    private static let currentToken = OSAllocatedUnfairLock<SinkToken?>(initialState: nil)
 
     private struct LegacyClosureSink: OpenSelectionDiagnosticsSink {
         let minimumLevel: LogLevel = .trace
@@ -26,8 +27,14 @@ public enum OpenSelectionLogging: Sendable {
         }
         set {
             customLoggerLock.withLock { $0 = newValue }
-            if let newValue {
-                DiagnosticsHub.shared.install(LegacyClosureSink(closure: newValue))
+            currentToken.withLock { token in
+                if let oldToken = token {
+                    DiagnosticsHub.shared.removeSink(oldToken)
+                    token = nil
+                }
+                if let newValue {
+                    token = DiagnosticsHub.shared.install(LegacyClosureSink(closure: newValue))
+                }
             }
         }
     }

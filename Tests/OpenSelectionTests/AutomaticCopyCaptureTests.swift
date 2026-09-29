@@ -84,7 +84,7 @@ final class AutomaticCopyCaptureTests: XCTestCase {
         XCTAssertEqual(board.string(forType: .string), "Original clipboard")
     }
 
-    func testUnknownMenuStateAllowsCopyWithWeakEvidence() async {
+    func testUnknownMenuStateBlocksCopyWithWeakEvidence() async {
         let board = pasteboard()
         defer { board.releaseGlobally() }
         var triggers = 0
@@ -103,8 +103,8 @@ final class AutomaticCopyCaptureTests: XCTestCase {
             menuState: { _ in .unknown(.timeout) },
             overlayPresent: { false }
         )
-        XCTAssertEqual(triggers, 1)
-        XCTAssertEqual(result?.text, "Selected text")
+        XCTAssertEqual(triggers, 0)
+        XCTAssertNil(result)
         XCTAssertEqual(board.string(forType: .string), "Original clipboard")
     }
 

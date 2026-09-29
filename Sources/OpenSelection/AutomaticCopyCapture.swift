@@ -27,7 +27,30 @@ final class CopyMenuProbe {
     private var cached: [pid_t: AXBox] = [:]
     private var inFlight: [pid_t: Task<CopyMenuState, Never>] = [:]
     private let queue = DispatchQueue(label: "com.openselection.copy-menu-probe",
-                                      qos: .userInitiated, attributes: .concurrent)
+                                      qos: .userInitiated)
+    nonisolated(unsafe) private var terminationObserver: (any NSObjectProtocol)?
+
+    init() {
+        terminationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didTerminateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            let pid = app?.processIdentifier
+            MainActor.assumeIsolated {
+                if let pid {
+                    self?.forget(pid)
+                }
+            }
+        }
+    }
+
+    deinit {
+        if let observer = terminationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+        }
+    }
 
     func forget(_ pid: pid_t) { cached[pid] = nil }   // call on app termination
 
@@ -64,9 +87,9 @@ final class CopyMenuProbe {
             case .invalidElement: cached[pid] = nil   // menu rebuilt; rediscover
             }
         }
-        let budget = max(timeout * 4, 0.5)          // cold walk happens once per PID
+        let budget = timeout
         let deadline = Date().addingTimeInterval(budget)
-        let outcome = await run(hardLimit: budget + 0.1, fallback: MenuProbeOutcome.timedOut) {
+        let outcome = await run(hardLimit: budget + 0.05, fallback: MenuProbeOutcome.timedOut) {
             AXMenuNavigator.probeMenuItem(.copy, in: AXUIElementCreateApplication(pid),
                                           matchingShortcutOnly: true, timeout: timeout, deadline: deadline)
         }
@@ -117,7 +140,18 @@ public enum AutomaticCopyCapture {
     ) async -> SelectionResult? {
         await capture(
             configuration: configuration,
-            request: CopyRequest(trigger: trigger, evidence: CopyEvidence("legacy-trigger", .strong))
+            request: CopyRequest(trigger: trigger, evidence: CopyEvidence("legacy-trigger", .weak))
+        )
+    }
+
+    /// Convenience overload if called with CopyRequest passed as trigger argument
+    public static func capture(
+        configuration: SelectionConfiguration = .default,
+        trigger: CopyRequest
+    ) async -> SelectionResult? {
+        await capture(
+            configuration: configuration,
+            request: trigger
         )
     }
 
@@ -138,9 +172,10 @@ public enum AutomaticCopyCapture {
                 "menuState": .token("\(state)"),
                 "evidence": .token(request.evidence.reason)
             ])
-            if state == .disabled {   // only a completed, settled read may veto
-                DiagnosticsHub.shared.log(.debug, .pasteboard, "automatic copy skipped, copy disabled and weak evidence", fields: [
-                    "pid": .int(Int64(pid))
+            guard state == .enabled else {
+                DiagnosticsHub.shared.log(.debug, .pasteboard, "automatic copy skipped, copy not enabled under weak evidence", fields: [
+                    "pid": .int(Int64(pid)),
+                    "menuState": .token("\(state)")
                 ])
                 return nil
             }

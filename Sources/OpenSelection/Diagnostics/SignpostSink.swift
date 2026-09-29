@@ -21,21 +21,21 @@ public struct SignpostSink: OpenSelectionDiagnosticsSink, Sendable {
 
     public func record(_ event: DiagnosticEvent) {
         guard signposter.isEnabled else { return }
-        let signpostID = signposter.makeSignpostID()
+        let signpostID = OSSignpostID(event.traceID.rawValue)
         signposter.emitEvent(
             "DiagnosticEvent",
             id: signpostID,
-            "\(event.category.rawValue, privacy: .public): \(event.message, privacy: .public)"
+            "[\(event.traceID.rawValue, privacy: .public)] \(event.category.rawValue, privacy: .public): \(event.message, privacy: .public)"
         )
     }
 
     public func finish(_ report: CascadeReport) {
         guard signposter.isEnabled else { return }
-        let signpostID = signposter.makeSignpostID()
+        let signpostID = OSSignpostID(report.traceID.rawValue)
         signposter.emitEvent(
             "CascadeFinished",
             id: signpostID,
-            "total=\(report.totalMicros)µs"
+            "[\(report.traceID.rawValue, privacy: .public)] total=\(report.totalMicros)µs"
         )
     }
 }

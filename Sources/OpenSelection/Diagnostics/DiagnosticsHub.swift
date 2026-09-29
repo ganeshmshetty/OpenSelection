@@ -24,13 +24,21 @@ public enum ReportMode: Sendable, Codable {
     case always
 }
 
+/// Registration token returned when installing a sink into DiagnosticsHub.
+public struct SinkToken: Sendable, Hashable {
+    public let id: UUID
+    public init(id: UUID = UUID()) { self.id = id }
+}
+
 /// Thread-safe central diagnostics coordinator.
 public final class DiagnosticsHub: Sendable {
     public static let shared = DiagnosticsHub()
 
     private struct State: Sendable {
-        var sinks: [any OpenSelectionDiagnosticsSink] = []
-        var floor: LogLevel? = nil
+        var sinks: [(token: SinkToken, sink: any OpenSelectionDiagnosticsSink)] = [
+            (token: SinkToken(), sink: OSLogSink(minimumLevel: .info))
+        ]
+        var floor: LogLevel? = .info
         var reportMode: ReportMode = .off
         var slowThresholdMicros: UInt64 = 40_000 // 40ms default
         var droppedEventCount: UInt64 = 0
@@ -41,22 +49,66 @@ public final class DiagnosticsHub: Sendable {
 
     public init() {}
 
-    /// Installs a new diagnostics sink.
-    public func install(_ sink: some OpenSelectionDiagnosticsSink) {
+    /// Installs a new diagnostics sink and returns a token that can be used to remove it.
+    @discardableResult
+    public func install(_ sink: some OpenSelectionDiagnosticsSink) -> SinkToken {
+        let token = SinkToken()
         state.withLock { s in
-            s.sinks.append(sink)
+            s.sinks.append((token: token, sink: sink))
+            recalculateFloor(&s)
+        }
+        return token
+    }
+
+    /// Removes a previously installed sink by its token.
+    public func removeSink(_ token: SinkToken) {
+        state.withLock { s in
+            s.sinks.removeAll { $0.token == token }
             recalculateFloor(&s)
         }
     }
 
-    /// Removes all installed sinks and resets configuration (primarily used in tests).
+    /// Resets configuration to default state with system logger.
     public func reset() {
+        state.withLock { s in
+            s.sinks = [(token: SinkToken(), sink: OSLogSink(minimumLevel: .info))]
+            s.reportMode = .off
+            s.slowThresholdMicros = 40_000
+            s.droppedEventCount = 0
+            recalculateFloor(&s)
+        }
+    }
+
+    /// Removes all installed sinks including the default OSLogSink (primarily used in tests).
+    public func removeAllSinks() {
         state.withLock { s in
             s.sinks.removeAll()
             s.floor = nil
             s.reportMode = .off
             s.slowThresholdMicros = 40_000
             s.droppedEventCount = 0
+        }
+    }
+
+    /// Checks if a cascade report should be constructed for the given outcome and duration.
+    public func isReportRequired(outcome: FinalOutcome? = nil, elapsedMicros: UInt64? = nil) -> Bool {
+        state.withLock { s in
+            switch s.reportMode {
+            case .off:
+                return false
+            case .always:
+                return !s.sinks.isEmpty
+            case .onFailureOrSlow:
+                guard !s.sinks.isEmpty else { return false }
+                guard let outcome else { return true }
+                let failed = outcome != .selection(strategy: .axTextControl, presence: .nonEmpty)
+                    && outcome != .selection(strategy: .axWebArea, presence: .nonEmpty)
+                    && outcome != .selection(strategy: .officeScript, presence: .nonEmpty)
+                    && outcome != .selection(strategy: .menuCopy, presence: .nonEmpty)
+                    && outcome != .selection(strategy: .keyboardCopy, presence: .nonEmpty)
+                let slow = (elapsedMicros ?? 0) >= s.slowThresholdMicros
+                return failed || slow
+            }
         }
     }
 
@@ -100,7 +152,7 @@ public final class DiagnosticsHub: Sendable {
     public func emit(_ event: DiagnosticEvent) {
         let matchingSinks: [any OpenSelectionDiagnosticsSink] = state.withLock { s in
             guard let floor = s.floor, event.level >= floor else { return [] }
-            return s.sinks.filter { event.level >= $0.minimumLevel }
+            return s.sinks.map(\.sink).filter { event.level >= $0.minimumLevel }
         }
 
         guard !matchingSinks.isEmpty else { return }
@@ -119,7 +171,7 @@ public final class DiagnosticsHub: Sendable {
             case .off:
                 return []
             case .always:
-                return s.sinks
+                return s.sinks.map(\.sink)
             case .onFailureOrSlow:
                 let failed = report.outcome != .selection(strategy: .axTextControl, presence: .nonEmpty)
                     && report.outcome != .selection(strategy: .axWebArea, presence: .nonEmpty)
@@ -127,7 +179,7 @@ public final class DiagnosticsHub: Sendable {
                     && report.outcome != .selection(strategy: .menuCopy, presence: .nonEmpty)
                     && report.outcome != .selection(strategy: .keyboardCopy, presence: .nonEmpty)
                 let slow = UInt64(report.totalMicros) >= s.slowThresholdMicros
-                return (failed || slow) ? s.sinks : []
+                return (failed || slow) ? s.sinks.map(\.sink) : []
             }
         }
 
@@ -153,7 +205,7 @@ public final class DiagnosticsHub: Sendable {
         if state.sinks.isEmpty {
             state.floor = nil
         } else {
-            state.floor = state.sinks.map(\.minimumLevel).min()
+            state.floor = state.sinks.map(\.sink.minimumLevel).min()
         }
     }
 
