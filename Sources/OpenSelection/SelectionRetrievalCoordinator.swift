@@ -46,8 +46,10 @@ public struct CopyRequest: Sendable {
 }
 
 public struct SelectionRetrievalCoordinator: Sendable {
-    public typealias TargetProvider = @Sendable () -> AXElementInspector.Target
+    public typealias TargetProvider = @Sendable (SelectionTrace?) -> AXElementInspector.Target
+    public typealias SimpleTargetProvider = @Sendable () -> AXElementInspector.Target
     public typealias CopyTrigger = PasteboardCopyEngine.CopyTrigger
+    public typealias LegacyCopyCapture = @Sendable (@escaping CopyTrigger) async -> SelectionResult?
     public typealias CopyCapture = @Sendable (CopyRequest) async -> SelectionResult?
     public typealias MenuPress = @Sendable (AXUIElement?) -> Void
     public typealias ScriptRunner = @Sendable (String) async throws -> String
@@ -77,11 +79,10 @@ public struct SelectionRetrievalCoordinator: Sendable {
     private let menuPress: MenuPress
     private let scriptRunner: ScriptRunner
 
-    /// The strategies, Edit ▸ Copy press, and script runner are injectable so unit tests can exercise the gate
-    /// and mode routing with fixture targets instead of the live accessibility tree.
+    /// Designated initializer accepting a trace-aware target provider.
     public init(
         configuration: SelectionConfiguration = .default,
-        inspect: @escaping TargetProvider = { AXElementInspector.inspect() },
+        inspect: @escaping TargetProvider = { trace in AXElementInspector.inspect(trace: trace) },
         copyCapture: CopyCapture? = nil,
         menuPress: @escaping MenuPress = Self.pressEditCopyMenu,
         scriptRunner: @escaping ScriptRunner = Self.defaultScriptRunner
@@ -93,6 +94,74 @@ public struct SelectionRetrievalCoordinator: Sendable {
         }
         self.menuPress = menuPress
         self.scriptRunner = scriptRunner
+    }
+
+    /// Convenience initializer accepting a parameterless target provider.
+    public init(
+        configuration: SelectionConfiguration = .default,
+        inspect: @escaping SimpleTargetProvider,
+        copyCapture: CopyCapture? = nil,
+        menuPress: @escaping MenuPress = Self.pressEditCopyMenu,
+        scriptRunner: @escaping ScriptRunner = Self.defaultScriptRunner
+    ) {
+        self.init(
+            configuration: configuration,
+            inspect: { _ in inspect() },
+            copyCapture: copyCapture,
+            menuPress: menuPress,
+            scriptRunner: scriptRunner
+        )
+    }
+
+    /// Convenience initializer accepting inspectWithTrace explicitly.
+    public init(
+        configuration: SelectionConfiguration = .default,
+        inspectWithTrace: @escaping TargetProvider,
+        copyCapture: CopyCapture? = nil,
+        menuPress: @escaping MenuPress = Self.pressEditCopyMenu,
+        scriptRunner: @escaping ScriptRunner = Self.defaultScriptRunner
+    ) {
+        self.init(
+            configuration: configuration,
+            inspect: inspectWithTrace,
+            copyCapture: copyCapture,
+            menuPress: menuPress,
+            scriptRunner: scriptRunner
+        )
+    }
+
+    /// Overload supporting legacy copyCapture closures taking CopyTrigger directly.
+    public init(
+        configuration: SelectionConfiguration = .default,
+        inspect: @escaping SimpleTargetProvider,
+        legacyCopyCapture: @escaping LegacyCopyCapture,
+        menuPress: @escaping MenuPress = Self.pressEditCopyMenu,
+        scriptRunner: @escaping ScriptRunner = Self.defaultScriptRunner
+    ) {
+        self.init(
+            configuration: configuration,
+            inspect: { _ in inspect() },
+            copyCapture: { request in await legacyCopyCapture(request.trigger) },
+            menuPress: menuPress,
+            scriptRunner: scriptRunner
+        )
+    }
+
+    /// Overload supporting legacy copyCapture closures with trace-aware target provider.
+    public init(
+        configuration: SelectionConfiguration = .default,
+        inspect: @escaping TargetProvider = { trace in AXElementInspector.inspect(trace: trace) },
+        legacyCopyCapture: @escaping LegacyCopyCapture,
+        menuPress: @escaping MenuPress = Self.pressEditCopyMenu,
+        scriptRunner: @escaping ScriptRunner = Self.defaultScriptRunner
+    ) {
+        self.init(
+            configuration: configuration,
+            inspect: inspect,
+            copyCapture: { request in await legacyCopyCapture(request.trigger) },
+            menuPress: menuPress,
+            scriptRunner: scriptRunner
+        )
     }
 
     /// Default AppleScript runner for Office selection retrieval.
@@ -155,9 +224,10 @@ public struct SelectionRetrievalCoordinator: Sendable {
         isSelectAll: Bool = false,
         allowCopyFallback: Bool = true,
         requireCopyEvidence: Bool = true,
+        trigger: TriggerSource = .programmatic,
         trace: SelectionTrace? = nil
     ) async -> (result: SelectionResult?, isEditable: Bool) {
-        let activeTrace = trace ?? SelectionTrace.create(trigger: .programmatic)
+        let activeTrace = trace ?? SelectionTrace.create(trigger: trigger)
         let bundleID = app.bundleIdentifier ?? "unknown"
         activeTrace.log(.debug, .cascade, "retrieval started", fields: [
             "bundleID": .token(bundleID),
@@ -169,18 +239,56 @@ public struct SelectionRetrievalCoordinator: Sendable {
             activeTrace.log(.warning, .ax, "ax inspect timed out", fields: [
                 "bundleID": .token(bundleID)
             ])
-            let report = activeTrace.buildReport(outcome: .none)
-            DiagnosticsHub.shared.emitReport(report)
+            if trace != nil || DiagnosticsHub.shared.isReportRequired(outcome: FinalOutcome.none, elapsedMicros: activeTrace.elapsedMicros) {
+                let report = activeTrace.buildReport(outcome: FinalOutcome.none)
+                DiagnosticsHub.shared.emitReport(report)
+            }
             return (nil, false)
         }
 
         let isEditable = Self.isEditableContext(target)
 
+        var targetPID: pid_t = app.processIdentifier ?? 0
+        if targetPID == 0, let axApp = target.focusedApp {
+            var pid: pid_t = 0
+            if AXUIElementGetPid(axApp, &pid) == .success {
+                targetPID = pid
+            }
+        }
+        if targetPID == 0 {
+            targetPID = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0
+        }
+
+        var targetArch: TargetArchitecture
+        #if arch(arm64)
+        targetArch = .arm64
+        #elseif arch(x86_64)
+        targetArch = .x86_64
+        #else
+        targetArch = .unknown
+        #endif
+
+        var isRosetta = false
+        if targetPID > 0, let running = NSRunningApplication(processIdentifier: targetPID) {
+            #if arch(arm64)
+            if running.executableArchitecture == NSBundleExecutableArchitectureX86_64 {
+                targetArch = .x86_64
+                isRosetta = true
+            } else if running.executableArchitecture == NSBundleExecutableArchitectureARM64 {
+                targetArch = .arm64
+            }
+            #elseif arch(x86_64)
+            if running.executableArchitecture == NSBundleExecutableArchitectureX86_64 {
+                targetArch = .x86_64
+            }
+            #endif
+        }
+
         let targetSnapshot = TargetSnapshot(
-            pid: 0,
-            bundleID: app.bundleIdentifier,
-            architecture: .arm64,
-            isRosettaTranslated: false,
+            pid: targetPID,
+            bundleID: app.bundleIdentifier ?? NSRunningApplication(processIdentifier: targetPID)?.bundleIdentifier,
+            architecture: targetArch,
+            isRosettaTranslated: isRosetta,
             framework: Self.frameworkFingerprint(for: app.bundleIdentifier),
             cursor: Self.cursorKind(from: cursor),
             windowBounds: target.bounds
@@ -195,8 +303,10 @@ public struct SelectionRetrievalCoordinator: Sendable {
                     "bundleID": .token(bundleID),
                     "role": .token(role)
                 ])
-                let report = activeTrace.buildReport(outcome: .none)
-                DiagnosticsHub.shared.emitReport(report)
+                if trace != nil || DiagnosticsHub.shared.isReportRequired(outcome: FinalOutcome.none, elapsedMicros: activeTrace.elapsedMicros) {
+                    let report = activeTrace.buildReport(outcome: FinalOutcome.none)
+                    DiagnosticsHub.shared.emitReport(report)
+                }
                 return (nil, isEditable)
             }
         }
@@ -207,16 +317,20 @@ public struct SelectionRetrievalCoordinator: Sendable {
                 "bundleID": .token(bundleID),
                 "cursor": .token(cursor.rawValue)
             ])
-            let report = activeTrace.buildReport(outcome: .none)
-            DiagnosticsHub.shared.emitReport(report)
+            if trace != nil || DiagnosticsHub.shared.isReportRequired(outcome: FinalOutcome.none, elapsedMicros: activeTrace.elapsedMicros) {
+                let report = activeTrace.buildReport(outcome: FinalOutcome.none)
+                DiagnosticsHub.shared.emitReport(report)
+            }
             return (nil, isEditable)
         }
 
         // Whole-container select gesture (⌘A, ⌘L) landing on a row selection (Finder, Mail, table views)
         if isSelectAll, Self.isRowSelectionContext(target) {
             activeTrace.log(.debug, .gate, "select-all on row-selection element skipped")
-            let report = activeTrace.buildReport(outcome: .none)
-            DiagnosticsHub.shared.emitReport(report)
+            if trace != nil || DiagnosticsHub.shared.isReportRequired(outcome: FinalOutcome.none, elapsedMicros: activeTrace.elapsedMicros) {
+                let report = activeTrace.buildReport(outcome: FinalOutcome.none)
+                DiagnosticsHub.shared.emitReport(report)
+            }
             return (nil, isEditable)
         }
 
@@ -264,11 +378,14 @@ public struct SelectionRetrievalCoordinator: Sendable {
             finalOutcome = .none
         }
 
-        let report = activeTrace.buildReport(outcome: finalOutcome)
-        DiagnosticsHub.shared.emitReport(report)
-        let resultWithDiagnostics = readResult?.withDiagnostics(report)
-
-        return (resultWithDiagnostics, isEditable)
+        if trace != nil || DiagnosticsHub.shared.isReportRequired(outcome: finalOutcome, elapsedMicros: activeTrace.elapsedMicros) {
+            let report = activeTrace.buildReport(outcome: finalOutcome)
+            DiagnosticsHub.shared.emitReport(report)
+            let resultWithDiagnostics = readResult?.withDiagnostics(report)
+            return (resultWithDiagnostics, isEditable)
+        } else {
+            return (readResult, isEditable)
+        }
     }
 
     /// Convenience for NSRunningApplication.
@@ -279,6 +396,7 @@ public struct SelectionRetrievalCoordinator: Sendable {
         isSelectAll: Bool = false,
         allowCopyFallback: Bool = true,
         requireCopyEvidence: Bool = true,
+        trigger: TriggerSource = .programmatic,
         trace: SelectionTrace? = nil
     ) async -> (result: SelectionResult?, isEditable: Bool) {
         await retrieveDetails(
@@ -288,6 +406,7 @@ public struct SelectionRetrievalCoordinator: Sendable {
             isSelectAll: isSelectAll,
             allowCopyFallback: allowCopyFallback,
             requireCopyEvidence: requireCopyEvidence,
+            trigger: trigger,
             trace: trace
         )
     }
@@ -300,6 +419,7 @@ public struct SelectionRetrievalCoordinator: Sendable {
         isSelectAll: Bool = false,
         allowCopyFallback: Bool = true,
         requireCopyEvidence: Bool = true,
+        trigger: TriggerSource = .programmatic,
         trace: SelectionTrace? = nil
     ) async -> SelectionResult? {
         await retrieveDetails(
@@ -309,6 +429,7 @@ public struct SelectionRetrievalCoordinator: Sendable {
             isSelectAll: isSelectAll,
             allowCopyFallback: allowCopyFallback,
             requireCopyEvidence: requireCopyEvidence,
+            trigger: trigger,
             trace: trace
         ).result
     }
@@ -321,6 +442,7 @@ public struct SelectionRetrievalCoordinator: Sendable {
         isSelectAll: Bool = false,
         allowCopyFallback: Bool = true,
         requireCopyEvidence: Bool = true,
+        trigger: TriggerSource = .programmatic,
         trace: SelectionTrace? = nil
     ) async -> SelectionResult? {
         await retrieve(
@@ -330,6 +452,7 @@ public struct SelectionRetrievalCoordinator: Sendable {
             isSelectAll: isSelectAll,
             allowCopyFallback: allowCopyFallback,
             requireCopyEvidence: requireCopyEvidence,
+            trigger: trigger,
             trace: trace
         )
     }
@@ -375,13 +498,21 @@ public struct SelectionRetrievalCoordinator: Sendable {
             var evidence: CopyEvidence? = nil
             if strategy == .keyboardCopy || strategy == .menuCopy {
                 if requireCopyEvidence {
-                    if let ev = Self.copyEvidence(
+                    if let initial = Self.copyEvidence(
                         strategy,
                         target: target,
                         cursor: cursor,
                         bundleID: app.bundleIdentifier,
                         isFallbackFromAX: index > 0
                     ) {
+                        let ev = await settledCopyEvidence(
+                            initial,
+                            strategy: strategy,
+                            cursor: cursor,
+                            bundleID: app.bundleIdentifier,
+                            isFallbackFromAX: index > 0,
+                            trace: trace
+                        )
                         evidence = ev
                         trace.log(.debug, .gate, "copy strategy permitted", fields: [
                             "bundleID": .token(bundleID),
@@ -406,7 +537,8 @@ public struct SelectionRetrievalCoordinator: Sendable {
                     evidence = CopyEvidence("waived-ax-blind-surface", .strong)
                 }
             }
-            if let result = Self.nonBlank(await run(strategy, app: app, target: target, evidence: evidence, trace: trace)) {
+            let (rawResult, outcome) = await run(strategy, app: app, target: target, evidence: evidence, trace: trace)
+            if let result = Self.nonBlank(rawResult) {
                 let duration = UInt32(min(UInt64(UInt32.max), trace.elapsedMicros - UInt64(attemptStart)))
                 trace.recordAttempt(StrategyAttempt(
                     strategy: strategy,
@@ -437,7 +569,7 @@ public struct SelectionRetrievalCoordinator: Sendable {
                 let duration = UInt32(min(UInt64(UInt32.max), trace.elapsedMicros - UInt64(attemptStart)))
                 trace.recordAttempt(StrategyAttempt(
                     strategy: strategy,
-                    outcome: .empty(.noSelection),
+                    outcome: outcome,
                     startOffsetMicros: attemptStart,
                     durationMicros: duration
                 ))
@@ -500,13 +632,14 @@ public struct SelectionRetrievalCoordinator: Sendable {
         // Keep the capture when it carries anything the AX read cannot express: HTML, RTF,
         // multi-line text, or app-private pasteboard flavors (e.g. `com.apple.notes.richtext`).
         // A single-line capture with only flavors must still replace the flavorless AX result.
-        guard let captured = Self.nonBlank(await run(
+        let (capturedRaw, _) = await run(
             .keyboardCopy,
             app: app,
             target: target,
             evidence: CopyEvidence("rich-enrichment", .strong),
             trace: trace
-        )),
+        )
+        guard let captured = Self.nonBlank(capturedRaw),
               captured.html != nil || captured.rtf != nil || !captured.flavors.isEmpty || captured.text.contains("\n") else {
             return result
         }
@@ -573,35 +706,41 @@ public struct SelectionRetrievalCoordinator: Sendable {
         target: AXElementInspector.Target,
         evidence: CopyEvidence? = nil,
         trace: SelectionTrace? = nil
-    ) async -> SelectionResult? {
+    ) async -> (result: SelectionResult?, outcome: StrategyOutcome) {
         switch strategy {
         case .axTextControl:
-            return AXTextControlStrategy.read(from: target)
+            if let res = AXTextControlStrategy.read(from: target) {
+                return (res, .succeeded)
+            }
+            if let len = Self.rangeLength(of: target), len == 0 {
+                return (nil, .empty(.rangeZero))
+            }
+            return (nil, .empty(.noSelection))
 
         case .axWebArea:
             var snapshot: AXElementInspector.Target? = target
             var attempts = 0
             while attempts < configuration.webAreaSettleMaxRetries {
                 if let snapshot, let result = AXWebAreaStrategy.read(from: snapshot) {
-                    return result
+                    return (result, .succeeded)
                 }
                 attempts += 1
                 if attempts < configuration.webAreaSettleMaxRetries {
                     try? await Task.sleep(nanoseconds: UInt64(configuration.webAreaSettleInterval * 1_000_000_000))
                     if let element = snapshot?.webArea ?? snapshot?.focusedElement,
                        let result = AXWebAreaStrategy.pollFresh(from: element) {
-                        return result
+                        return (result, .succeeded)
                     }
                     snapshot = await inspectWithWatchdog(trace: trace)
                 }
             }
-            return nil
+            return (nil, attempts > 0 ? .timedOut : .empty(.noSelection))
 
         case .officeScript:
             return await runOfficeScript(for: app, target: target, trace: trace)
 
         case .browserScript:
-            return nil
+            return (nil, .skipped(.noTextEvidence))
 
         case .menuCopy, .keyboardCopy:
             let trigger: CopyTrigger
@@ -624,11 +763,13 @@ public struct SelectionRetrievalCoordinator: Sendable {
                 let copyKey = configuration.copyVirtualKey
                 trigger = { KeyboardEventPoster.postKey(keyCode: copyKey, flags: .maskCommand) }
             default:
-                return nil
+                return (nil, .empty(.noSelection))
             }
             let request = CopyRequest(trigger: trigger, evidence: evidence ?? CopyEvidence("unspecified", .weak))
-            guard let captured = await copyCapture(request) else { return nil }
-            return SelectionResult(
+            guard let captured = await copyCapture(request) else {
+                return (nil, Task.isCancelled ? .cancelled : .empty(.noSelection))
+            }
+            let res = SelectionResult(
                 text: captured.text,
                 bounds: target.bounds,
                 html: captured.html,
@@ -638,6 +779,7 @@ public struct SelectionRetrievalCoordinator: Sendable {
                 strategy: strategy,
                 isEditable: false
             )
+            return (res, .succeeded)
         }
     }
 
@@ -678,11 +820,11 @@ public struct SelectionRetrievalCoordinator: Sendable {
         for app: AppIdentity,
         target: AXElementInspector.Target,
         trace: SelectionTrace? = nil
-    ) async -> SelectionResult? {
-        guard let bundleID = app.bundleIdentifier else { return nil }
+    ) async -> (result: SelectionResult?, outcome: StrategyOutcome) {
+        guard let bundleID = app.bundleIdentifier else { return (nil, .empty(.noSelection)) }
         guard let script = Self.officeScript(for: bundleID) else {
             trace?.log(.warning, .cascade, "office script template missing", fields: ["bundleID": .token(bundleID)])
-            return nil
+            return (nil, .failed(.scriptError))
         }
         do {
             let timeout = configuration.officeScriptTimeout
@@ -700,22 +842,22 @@ public struct SelectionRetrievalCoordinator: Sendable {
                 return first
             }
             let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty, trimmed != "missing value" else { return nil }
-            return SelectionResult(
+            guard !trimmed.isEmpty, trimmed != "missing value" else { return (nil, .empty(.noSelection)) }
+            return (SelectionResult(
                 text: trimmed,
                 bounds: target.bounds,
                 strategy: .officeScript,
                 isEditable: true
-            )
+            ), .succeeded)
         } catch is CancellationError {
             trace?.log(.warning, .cascade, "office script timed out", fields: [
                 "bundleID": .token(bundleID),
                 "timeoutMicros": .micros(UInt32(configuration.officeScriptTimeout * 1_000_000))
             ])
-            return nil
+            return (nil, .timedOut)
         } catch {
             trace?.log(.warning, .cascade, "office script failed", fields: ["bundleID": .token(bundleID)])
-            return nil
+            return (nil, .failed(.scriptError))
         }
     }
 
@@ -743,7 +885,7 @@ public struct SelectionRetrievalCoordinator: Sendable {
             })
 
             Self.axInspectQueue.async {
-                let target = inspect()
+                let target = inspect(trace)
                 if resume.resume(continuation, with: target) {
                     timeout.cancel()
                     Task.detached { await Self.inspectGate.release() }
@@ -870,15 +1012,15 @@ public struct SelectionRetrievalCoordinator: Sendable {
         if let m = target.selectedMarkerText, !m.isEmpty { return .init("ax-marker-text", .strong) }
 
         let rangeLength = Self.rangeLength(of: target)
-        if let len = rangeLength, len > 0 { return .init("ax-selected-text-range(len=\(len))", .strong) }
+        if let len = rangeLength, len > 0 { return .init("ax-selected-text-range", .strong) }
 
         let isTextControl = target.role.map { textEvidenceRoles.contains($0) } == true
             || !target.containedInRoles.isDisjoint(with: textEvidenceRoles)
 
         if cursor == .beam {
-            // A control that *reports* an empty selection is authoritative: let the menu veto (TextEdit whitespace drag).
-            return (isTextControl && rangeLength == 0)
-                ? .init("beam-cursor+ax-empty-range", .weak)
+            // A control that lacks confirmed selection text/range must let the menu veto (TextEdit whitespace drag or empty text field).
+            return isTextControl
+                ? .init("beam-cursor+text-control", .weak)
                 : .init("beam-cursor", .strong)
         }
         if isTextControl { return .init("ax-text-control", .weak) }
@@ -888,6 +1030,50 @@ public struct SelectionRetrievalCoordinator: Sendable {
             if cursor == .unknown || cursor == .pointingHand { return .init("browser-cursor:\(cursor.rawValue)", .weak) }
         }
         return nil
+    }
+
+    /// Upgrades a weak text-control evidence verdict by briefly re-inspecting the target.
+    ///
+    /// On the first touch after a target app has been idle, its AX state can lag the gesture that
+    /// just made the selection: the inspect resolves the text-control role but `AXSelectedText`
+    /// still reads empty, so the verdict degrades to `ax-text-control`/`beam-cursor+text-control`
+    /// (weak) and the copy is then refused downstream for a selection that exists. A short
+    /// re-inspect — mirroring the AXWebArea settle retries — lets the lagging read settle into
+    /// strong evidence before the verdict reaches the menu gate. Anything but a strictly stronger
+    /// verdict keeps the original evidence: a re-inspect that comes back worse must not downgrade
+    /// the gate (and an app whose AX state genuinely reports no selection keeps the weak verdict,
+    /// which the menu gate still vets).
+    private func settledCopyEvidence(
+        _ evidence: CopyEvidence,
+        strategy: SelectionStrategy,
+        cursor: CursorClass,
+        bundleID: String?,
+        isFallbackFromAX: Bool,
+        trace: SelectionTrace
+    ) async -> CopyEvidence {
+        guard evidence.strength == .weak,
+              evidence.reason == "ax-text-control" || evidence.reason == "beam-cursor+text-control"
+        else { return evidence }
+        let maxRetries = max(0, configuration.evidenceSettleMaxRetries)
+        for _ in 0..<maxRetries {
+            if Task.isCancelled { return evidence }
+            try? await Task.sleep(nanoseconds: UInt64(configuration.evidenceSettleInterval * 1_000_000_000))
+            guard let fresh = await inspectWithWatchdog(trace: trace) else { return evidence }
+            guard let candidate = Self.copyEvidence(
+                strategy,
+                target: fresh,
+                cursor: cursor,
+                bundleID: bundleID,
+                isFallbackFromAX: isFallbackFromAX
+            ), candidate.strength > evidence.strength
+            else { continue }
+            trace.log(.debug, .gate, "copy evidence settled", fields: [
+                "from": .token(evidence.reason),
+                "to": .token(candidate.reason)
+            ])
+            return candidate
+        }
+        return evidence
     }
 
     private static func nonBlank(_ result: SelectionResult?) -> SelectionResult? {

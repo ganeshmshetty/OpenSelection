@@ -73,6 +73,17 @@ public struct SelectionResult: Sendable, Equatable {
         )
     }
 
+    public static func == (lhs: SelectionResult, rhs: SelectionResult) -> Bool {
+        lhs.text == rhs.text
+            && lhs.bounds == rhs.bounds
+            && lhs.html == rhs.html
+            && lhs.rtf == rhs.rtf
+            && lhs.flavors == rhs.flavors
+            && lhs.sourceApp == rhs.sourceApp
+            && lhs.strategy == rhs.strategy
+            && lhs.isEditable == rhs.isEditable
+    }
+
     /// Layout-accurate plain text.
     /// If the raw selection text was extracted from an accessibility tree that flattened
     /// block DOM elements into a single continuous line, but rich HTML is available,

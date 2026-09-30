@@ -6,7 +6,6 @@ import ApplicationServices
 import Foundation
 import OpenSelection
 
-@main
 struct DiagnoseCLI {
     static func main() async {
         let args = CommandLine.arguments
@@ -87,7 +86,12 @@ struct DiagnoseCLI {
         }
 
         if delay > 0 {
-            target = .focusedAfter(delay: delay)
+            switch target {
+            case .frontmost:
+                target = .focusedAfter(delay: delay)
+            case .pid, .bundleID, .focusedAfter:
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
         }
 
         let options = InspectionOptions(
@@ -133,3 +137,5 @@ struct DiagnoseCLI {
         """)
     }
 }
+
+await DiagnoseCLI.main()

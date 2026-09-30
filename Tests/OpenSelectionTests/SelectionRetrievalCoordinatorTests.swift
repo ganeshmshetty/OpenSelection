@@ -394,6 +394,74 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
         XCTAssertEqual(result?.text, "captured keyboard copy")
     }
 
+    /// On the first touch after a target app was idle, its AX state can lag the gesture that just
+    /// made the selection: the inspect resolves the text-control role but `AXSelectedText` reads
+    /// empty, so the verdict degrades to weak `ax-text-control`. The settle retries must re-inspect
+    /// until the lagging read turns into strong `ax-selected-text` evidence. Regression: the first
+    /// selection after idle in a terminal/copy app produced no popup, immediate repeats worked.
+    func testLaggingTextControlEvidenceSettlesIntoStrongEvidence() async {
+        final class InspectCounter: @unchecked Sendable { var calls = 0 }
+        let counter = InspectCounter()
+        final class EvidenceBox: @unchecked Sendable { var evidence: CopyEvidence? }
+        let box = EvidenceBox()
+        let configuration = SelectionConfiguration(evidenceSettleInterval: 0.001, evidenceSettleMaxRetries: 4)
+        let coordinator = SelectionRetrievalCoordinator(
+            configuration: configuration,
+            inspect: { _ in
+                counter.calls += 1
+                // Cold on the first inspect (role resolved, selection not yet), warm afterwards.
+                return counter.calls == 1
+                    ? Self.textFieldTarget(role: "AXTextArea")
+                    : Self.textFieldTarget(selectedText: "settled text", role: "AXTextArea")
+            },
+            copyCapture: { request in
+                box.evidence = request.evidence
+                return SelectionResult(text: "captured settled text")
+            }
+        )
+        let policy = AppPolicyContext(retrievalMode: .keyboardCopy)
+        let result = await coordinator.retrieve(
+            for: AppIdentity(bundleIdentifier: "com.sublimetext.3"),
+            policy: policy,
+            cursor: .unknown
+        )
+        XCTAssertEqual(result?.text, "captured settled text")
+        XCTAssertEqual(box.evidence?.reason, "ax-selected-text")
+        XCTAssertEqual(box.evidence?.strength, .strong)
+        XCTAssertEqual(counter.calls, 2, "the settle retry must stop at the first stronger verdict")
+    }
+
+    /// A target whose AX state never confirms the selection keeps the original weak verdict after
+    /// a bounded number of settle retries — no infinite polling, and no downgrade to refusal.
+    func testUnconfirmedTextControlEvidenceKeepsWeakVerdictAfterBoundedRetries() async {
+        final class InspectCounter: @unchecked Sendable { var calls = 0 }
+        let counter = InspectCounter()
+        final class EvidenceBox: @unchecked Sendable { var evidence: CopyEvidence? }
+        let box = EvidenceBox()
+        let configuration = SelectionConfiguration(evidenceSettleInterval: 0.001, evidenceSettleMaxRetries: 2)
+        let coordinator = SelectionRetrievalCoordinator(
+            configuration: configuration,
+            inspect: { _ in
+                counter.calls += 1
+                return Self.textFieldTarget(role: "AXTextArea")
+            },
+            copyCapture: { request in
+                box.evidence = request.evidence
+                return SelectionResult(text: "captured anyway")
+            }
+        )
+        let policy = AppPolicyContext(retrievalMode: .keyboardCopy)
+        let result = await coordinator.retrieve(
+            for: AppIdentity(bundleIdentifier: "com.sublimetext.3"),
+            policy: policy,
+            cursor: .unknown
+        )
+        XCTAssertEqual(result?.text, "captured anyway")
+        XCTAssertEqual(box.evidence?.reason, "ax-text-control")
+        XCTAssertEqual(box.evidence?.strength, .weak)
+        XCTAssertEqual(counter.calls, 3, "one initial inspect plus exactly evidenceSettleMaxRetries retries")
+    }
+
     /// OneNote's canvas exposes no AX text-selection evidence (no cursor class, no
     /// `AXSelectedText`/range, no text-control role), so the copy-evidence gate would skip the only
     /// strategy that can read it and retrieval would always return nil. The allowlist waives the

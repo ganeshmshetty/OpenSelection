@@ -19,11 +19,18 @@ public struct SelectionTriggerSignal: Sendable {
     public let app: NSRunningApplication?
     public let isSelectAll: Bool
     public let cursor: CGPoint?
+    public let trigger: TriggerSource?
 
-    public init(app: NSRunningApplication? = nil, isSelectAll: Bool = false, cursor: CGPoint? = nil) {
+    public init(
+        app: NSRunningApplication? = nil,
+        isSelectAll: Bool = false,
+        cursor: CGPoint? = nil,
+        trigger: TriggerSource? = nil
+    ) {
         self.app = app
         self.isSelectAll = isSelectAll
         self.cursor = cursor
+        self.trigger = trigger
     }
 }
 
@@ -336,10 +343,12 @@ public final class OpenSelectionMonitor {
 
             let appIdentity = AppIdentity(app)
             let cursorClass = self.currentCursorProvider()
+            let trigger: TriggerSource = clickCount >= 2 ? .doubleClick : .mouseUp
             let result = await self.coordinator.retrieve(
                 for: appIdentity,
                 policy: .default,
-                cursor: cursorClass
+                cursor: cursorClass,
+                trigger: trigger
             )
             guard !Task.isCancelled else { return }
             if let result, TextSanitizer.isSubstantial(result.text) {
@@ -377,7 +386,8 @@ public final class OpenSelectionMonitor {
                 for: appIdentity,
                 policy: .default,
                 cursor: cursorClass,
-                isSelectAll: isSelectAll
+                isSelectAll: isSelectAll,
+                trigger: .keyboardShortcut
             )
             guard !Task.isCancelled else { return }
             if let result, TextSanitizer.isSubstantial(result.text) {
@@ -399,11 +409,13 @@ public final class OpenSelectionMonitor {
 
             let appIdentity = AppIdentity(targetApp)
             let cursorClass = self.currentCursorProvider()
+            let trigger = signal.trigger ?? (signal.isSelectAll ? .keyboardShortcut : .programmatic)
             let result = await self.coordinator.retrieve(
                 for: appIdentity,
                 policy: .default,
                 cursor: cursorClass,
-                isSelectAll: signal.isSelectAll
+                isSelectAll: signal.isSelectAll,
+                trigger: trigger
             )
             guard !Task.isCancelled else { return }
             if let result, TextSanitizer.isSubstantial(result.text) {

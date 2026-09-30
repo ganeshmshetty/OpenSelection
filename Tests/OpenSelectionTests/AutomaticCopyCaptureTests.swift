@@ -84,7 +84,7 @@ final class AutomaticCopyCaptureTests: XCTestCase {
         XCTAssertEqual(board.string(forType: .string), "Original clipboard")
     }
 
-    func testUnknownMenuStateAllowsCopyWithWeakEvidence() async {
+    func testUnknownMenuStateProceedsWithWeakEvidence() async {
         let board = pasteboard()
         defer { board.releaseGlobally() }
         var triggers = 0
@@ -101,6 +101,54 @@ final class AutomaticCopyCaptureTests: XCTestCase {
             pasteboard: board,
             frontmostPID: { 42 },
             menuState: { _ in .unknown(.timeout) },
+            overlayPresent: { false }
+        )
+        XCTAssertEqual(triggers, 1)
+        XCTAssertEqual(result?.text, "Selected text")
+        XCTAssertEqual(board.string(forType: .string), "Original clipboard")
+    }
+
+    func testNoCopyItemMenuStateProceedsWithWeakEvidence() async {
+        let board = pasteboard()
+        defer { board.releaseGlobally() }
+        var triggers = 0
+        let request = CopyRequest(
+            trigger: {
+                triggers += 1
+                board.clearContents()
+                board.setString("Selected text", forType: .string)
+            },
+            evidence: CopyEvidence("test-weak", .weak)
+        )
+        let result = await AutomaticCopyCapture.capture(
+            request: request,
+            pasteboard: board,
+            frontmostPID: { 42 },
+            menuState: { _ in .unknown(.noCopyItem) },
+            overlayPresent: { false }
+        )
+        XCTAssertEqual(triggers, 1)
+        XCTAssertEqual(result?.text, "Selected text")
+        XCTAssertEqual(board.string(forType: .string), "Original clipboard")
+    }
+
+    func testNoMenuBarMenuStateProceedsWithWeakEvidence() async {
+        let board = pasteboard()
+        defer { board.releaseGlobally() }
+        var triggers = 0
+        let request = CopyRequest(
+            trigger: {
+                triggers += 1
+                board.clearContents()
+                board.setString("Selected text", forType: .string)
+            },
+            evidence: CopyEvidence("test-weak", .weak)
+        )
+        let result = await AutomaticCopyCapture.capture(
+            request: request,
+            pasteboard: board,
+            frontmostPID: { 42 },
+            menuState: { _ in .unknown(.noMenuBar) },
             overlayPresent: { false }
         )
         XCTAssertEqual(triggers, 1)
