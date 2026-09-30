@@ -24,6 +24,15 @@ public struct SelectionConfiguration: Sendable, Equatable {
     /// Maximum number of retry polls for web area selections before giving up.
     public var webAreaSettleMaxRetries: Int
 
+    /// Interval (seconds) between settle-retry re-inspects for lagging copy evidence: a text
+    /// control whose `AXSelectedText` read came back empty on the first touch after the target
+    /// app was idle (the AX state lags the gesture that just made the selection).
+    public var evidenceSettleInterval: TimeInterval
+
+    /// Maximum number of settle-retry re-inspects for lagging copy evidence before the weak
+    /// verdict stands and is handed to the menu gate.
+    public var evidenceSettleMaxRetries: Int
+
     /// Delay (seconds) before restoring the archived pasteboard on successful capture.
     public var pasteboardRestoreDelay: TimeInterval
 
@@ -69,6 +78,8 @@ public struct SelectionConfiguration: Sendable, Equatable {
         safariPasteboardCopyTimeout: TimeInterval = 0.4,
         webAreaSettleInterval: TimeInterval = 0.05,
         webAreaSettleMaxRetries: Int = 6,
+        evidenceSettleInterval: TimeInterval = 0.05,
+        evidenceSettleMaxRetries: Int = 2,
         pasteboardRestoreDelay: TimeInterval = 0.01,
         copyVirtualKey: CGKeyCode = 0x08,
         ancestorWalkDepth: Int = 25,
@@ -85,6 +96,8 @@ public struct SelectionConfiguration: Sendable, Equatable {
         self.safariPasteboardCopyTimeout = safariPasteboardCopyTimeout
         self.webAreaSettleInterval = webAreaSettleInterval
         self.webAreaSettleMaxRetries = webAreaSettleMaxRetries
+        self.evidenceSettleInterval = evidenceSettleInterval
+        self.evidenceSettleMaxRetries = evidenceSettleMaxRetries
         self.pasteboardRestoreDelay = pasteboardRestoreDelay
         self.copyVirtualKey = copyVirtualKey
         self.ancestorWalkDepth = ancestorWalkDepth

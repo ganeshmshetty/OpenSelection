@@ -172,12 +172,25 @@ public enum AutomaticCopyCapture {
                 "menuState": .token("\(state)"),
                 "evidence": .token(request.evidence.reason)
             ])
-            guard state == .enabled else {
-                DiagnosticsHub.shared.log(.debug, .pasteboard, "automatic copy skipped, copy not enabled under weak evidence", fields: [
+            guard state != .disabled else {
+                DiagnosticsHub.shared.log(.debug, .pasteboard, "automatic copy skipped, copy disabled under weak evidence", fields: [
                     "pid": .int(Int64(pid)),
                     "menuState": .token("\(state)")
                 ])
                 return nil
+            }
+            if case .unknown(let reason) = state {
+                // "Couldn't tell" is not "disabled" (the CopyMenuProbe contract itself never
+                // conflates the two): a terminal omits the AppKit Edit ▸ Copy item entirely, so
+                // `noCopyItem` is its steady state, and a cold menu walk times out without
+                // meaning. Refusing here turns every inconclusive probe into a permanent
+                // retrieval failure. The pasteboard engine snapshots and restores around the
+                // trigger, so proceeding on an unknown verdict cannot clobber the clipboard —
+                // only a positive `.disabled` refuses.
+                DiagnosticsHub.shared.log(.debug, .pasteboard, "copy menu state unknown, proceeding under weak evidence", fields: [
+                    "pid": .int(Int64(pid)),
+                    "reason": .token(reason.rawValue)
+                ])
             }
         } else {
             DiagnosticsHub.shared.log(.debug, .pasteboard, "automatic copy proceeding with strong evidence", fields: [

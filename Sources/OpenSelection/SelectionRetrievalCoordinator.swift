@@ -498,13 +498,21 @@ public struct SelectionRetrievalCoordinator: Sendable {
             var evidence: CopyEvidence? = nil
             if strategy == .keyboardCopy || strategy == .menuCopy {
                 if requireCopyEvidence {
-                    if let ev = Self.copyEvidence(
+                    if let initial = Self.copyEvidence(
                         strategy,
                         target: target,
                         cursor: cursor,
                         bundleID: app.bundleIdentifier,
                         isFallbackFromAX: index > 0
                     ) {
+                        let ev = await settledCopyEvidence(
+                            initial,
+                            strategy: strategy,
+                            cursor: cursor,
+                            bundleID: app.bundleIdentifier,
+                            isFallbackFromAX: index > 0,
+                            trace: trace
+                        )
                         evidence = ev
                         trace.log(.debug, .gate, "copy strategy permitted", fields: [
                             "bundleID": .token(bundleID),
@@ -1022,6 +1030,50 @@ public struct SelectionRetrievalCoordinator: Sendable {
             if cursor == .unknown || cursor == .pointingHand { return .init("browser-cursor:\(cursor.rawValue)", .weak) }
         }
         return nil
+    }
+
+    /// Upgrades a weak text-control evidence verdict by briefly re-inspecting the target.
+    ///
+    /// On the first touch after a target app has been idle, its AX state can lag the gesture that
+    /// just made the selection: the inspect resolves the text-control role but `AXSelectedText`
+    /// still reads empty, so the verdict degrades to `ax-text-control`/`beam-cursor+text-control`
+    /// (weak) and the copy is then refused downstream for a selection that exists. A short
+    /// re-inspect — mirroring the AXWebArea settle retries — lets the lagging read settle into
+    /// strong evidence before the verdict reaches the menu gate. Anything but a strictly stronger
+    /// verdict keeps the original evidence: a re-inspect that comes back worse must not downgrade
+    /// the gate (and an app whose AX state genuinely reports no selection keeps the weak verdict,
+    /// which the menu gate still vets).
+    private func settledCopyEvidence(
+        _ evidence: CopyEvidence,
+        strategy: SelectionStrategy,
+        cursor: CursorClass,
+        bundleID: String?,
+        isFallbackFromAX: Bool,
+        trace: SelectionTrace
+    ) async -> CopyEvidence {
+        guard evidence.strength == .weak,
+              evidence.reason == "ax-text-control" || evidence.reason == "beam-cursor+text-control"
+        else { return evidence }
+        let maxRetries = max(0, configuration.evidenceSettleMaxRetries)
+        for _ in 0..<maxRetries {
+            if Task.isCancelled { return evidence }
+            try? await Task.sleep(nanoseconds: UInt64(configuration.evidenceSettleInterval * 1_000_000_000))
+            guard let fresh = await inspectWithWatchdog(trace: trace) else { return evidence }
+            guard let candidate = Self.copyEvidence(
+                strategy,
+                target: fresh,
+                cursor: cursor,
+                bundleID: bundleID,
+                isFallbackFromAX: isFallbackFromAX
+            ), candidate.strength > evidence.strength
+            else { continue }
+            trace.log(.debug, .gate, "copy evidence settled", fields: [
+                "from": .token(evidence.reason),
+                "to": .token(candidate.reason)
+            ])
+            return candidate
+        }
+        return evidence
     }
 
     private static func nonBlank(_ result: SelectionResult?) -> SelectionResult? {
