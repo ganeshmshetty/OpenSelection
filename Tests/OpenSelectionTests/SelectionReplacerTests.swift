@@ -40,7 +40,8 @@ final class SelectionReplacerTests: XCTestCase {
             focusedElementProvider: { _ in AXUIElementCreateSystemWide() },
             directAXReplacer: { _, _ in true },
             keyPoster: { _, _ in box.keyPosted = true },
-            appActivator: { _ in }
+            appActivator: { _ in },
+            targetActiveChecker: { _ in true }
         )
 
         try await replacer.replace(with: "replacement", in: dummyApp)
@@ -68,7 +69,8 @@ final class SelectionReplacerTests: XCTestCase {
                 box.postedKeyCode = keyCode
                 box.postedFlags = flags
             },
-            appActivator: { _ in box.activated = true }
+            appActivator: { _ in box.activated = true },
+            targetActiveChecker: { _ in true }
         )
 
         try await replacer.replace(with: "transient text", in: dummyApp, restorePasteboard: true)
@@ -94,7 +96,8 @@ final class SelectionReplacerTests: XCTestCase {
             pasteboard: testPasteboard,
             directAXReplacer: { _, _ in false },
             keyPoster: { _, _ in },
-            appActivator: { _ in }
+            appActivator: { _ in },
+            targetActiveChecker: { _ in true }
         )
 
         try await replacer.replace(with: "permanent text", in: dummyApp, restorePasteboard: false)
@@ -124,7 +127,8 @@ final class SelectionReplacerTests: XCTestCase {
                 box.pasteboard?.clearContents()
                 box.pasteboard?.setString("user copied this mid-flight", forType: .string)
             },
-            appActivator: { _ in }
+            appActivator: { _ in },
+            targetActiveChecker: { _ in true }
         )
 
         try await replacer.replace(with: "transient text", in: dummyApp, restorePasteboard: true)
@@ -139,7 +143,8 @@ final class SelectionReplacerTests: XCTestCase {
             pasteboard: testPasteboard,
             directAXReplacer: { _, _ in false },
             keyPoster: { _, _ in },
-            appActivator: { _ in }
+            appActivator: { _ in },
+            targetActiveChecker: { _ in true }
         )
 
         try await replacer.replace(with: "no app text", in: nil, restorePasteboard: false)
@@ -157,7 +162,8 @@ final class SelectionReplacerTests: XCTestCase {
                 box.postedKeyCode = code
                 box.postedFlags = flags
             },
-            appActivator: { _ in }
+            appActivator: { _ in },
+            targetActiveChecker: { _ in true }
         )
 
         try await replacer.replace(
@@ -184,7 +190,8 @@ final class SelectionReplacerTests: XCTestCase {
             pasteboard: testPasteboard,
             directAXReplacer: { _, _ in false },
             keyPoster: { _, _ in },
-            appActivator: { _ in }
+            appActivator: { _ in },
+            targetActiveChecker: { _ in true }
         )
 
         // ISO Latin-1 bytes that are not valid UTF-8: they must survive the String bridge intact.
@@ -203,7 +210,8 @@ final class SelectionReplacerTests: XCTestCase {
             pasteboard: testPasteboard,
             directAXReplacer: { _, _ in false },
             keyPoster: { _, _ in },
-            appActivator: { _ in }
+            appActivator: { _ in },
+            targetActiveChecker: { _ in true }
         )
         let proprietaryType = NSPasteboard.PasteboardType("com.apple.notes.richtext")
         let proprietaryData = Data([0x00, 0x01, 0xFE, 0xFF])
@@ -244,4 +252,85 @@ final class SelectionReplacerTests: XCTestCase {
         XCTAssertTrue(formatted.contains("\n"), "Formatted text should restore paragraph breaks from RTF")
         XCTAssertGreaterThanOrEqual(result.metrics.paragraphs, 2)
     }
+    @MainActor
+    func testRapidPastesConsumeTheirOwnPayloadsDuringDeliveryWindows() async throws {
+        let board = testPasteboard!
+        board.setString("original", forType: .string)
+        let firstPosted = expectation(description: "first paste posted")
+        let consumed = expectation(description: "both external pastes consumed")
+        consumed.expectedFulfillmentCount = 2
+        var payloads: [String] = []
+        var posts = 0
+        let replacer = SelectionReplacer(
+            configuration: SelectionConfiguration(pasteboardDeliveryRestoreDelay: 0.06),
+            pasteboard: board, focusedElementProvider: { _ in nil },
+            directAXReplacer: { _, _ in false },
+            keyPoster: { _, _ in
+                posts += 1
+                if posts == 1 { firstPosted.fulfill() }
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 20_000_000)
+                    payloads.append(board.string(forType: .string) ?? "missing")
+                    consumed.fulfill()
+                }
+            }, appActivator: { _ in }, targetActiveChecker: { _ in true }
+        )
+        let first = Task { try await replacer.replace(with: "one", in: .current) }
+        await fulfillment(of: [firstPosted], timeout: 1)
+        let second = Task { try await replacer.replace(with: "two", in: .current) }
+        try await first.value
+        try await second.value
+        await fulfillment(of: [consumed], timeout: 1)
+        XCTAssertEqual(payloads, ["one", "two"])
+        XCTAssertEqual(board.string(forType: .string), "original")
+    }
+
+    @MainActor
+    func testFailedActivationLeavesBaselineAndDoesNotPost() async {
+        testPasteboard.setString("original", forType: .string)
+        let baselineCount = testPasteboard.changeCount
+        var posted = false
+        let replacer = SelectionReplacer(pasteboard: testPasteboard,
+            focusedElementProvider: { _ in nil }, directAXReplacer: { _, _ in false },
+            keyPoster: { _, _ in posted = true }, appActivator: { _ in },
+            targetActiveChecker: { _ in false })
+        do {
+            try await replacer.replace(with: "payload", in: .current)
+            XCTFail("Expected target failure")
+        } catch { }
+        XCTAssertFalse(posted)
+        XCTAssertEqual(testPasteboard.changeCount, baselineCount)
+        XCTAssertEqual(testPasteboard.string(forType: .string), "original")
+    }
+
+    @MainActor
+    func testCancelledCaptureDrainsPostedCopyBeforePaste() async throws {
+        let board = testPasteboard!
+        board.setString("original", forType: .string)
+        let copyPosted = expectation(description: "copy posted")
+        var pasted: String?
+        let capture = Task { @MainActor in
+            await PasteboardCopyEngine(isCopyAuthorized: { true }).capture(pasteboard: board, timeout: 0.15) {
+                copyPosted.fulfill()
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 20_000_000)
+                    board.clearContents(); board.setString("late copy", forType: .string)
+                }
+            }
+        }
+        await fulfillment(of: [copyPosted], timeout: 1)
+        capture.cancel()
+        let replacer = SelectionReplacer(
+            configuration: SelectionConfiguration(pasteboardDeliveryRestoreDelay: 0.03),
+            pasteboard: board, focusedElementProvider: { _ in nil },
+            directAXReplacer: { _, _ in false },
+            keyPoster: { _, _ in pasted = board.string(forType: .string) },
+            appActivator: { _ in }, targetActiveChecker: { _ in true })
+        try await replacer.replace(with: "paste payload", in: .current)
+        let captured = await capture.value
+        XCTAssertNil(captured)
+        XCTAssertEqual(pasted, "paste payload")
+        XCTAssertEqual(board.string(forType: .string), "original")
+    }
+
 }

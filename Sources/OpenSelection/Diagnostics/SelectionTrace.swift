@@ -41,6 +41,8 @@ public struct TriggerSource: Sendable, Codable, Equatable, ExpressibleByStringLi
 
 /// A request-scoped trace tracking timing and emitting correlated events.
 public final class SelectionTrace: Sendable {
+    @TaskLocal public static var current: SelectionTrace?
+
     private static let idCounter = OSAllocatedUnfairLock<UInt64>(initialState: 1)
 
     public let id: TraceID
@@ -100,6 +102,55 @@ public final class SelectionTrace: Sendable {
         recordedTarget.withLock { $0 = target }
     }
 
+    private let readStatus = OSAllocatedUnfairLock<SelectionReadStatus>(initialState: .noSelection)
+
+    public var selectionReadStatus: SelectionReadStatus { readStatus.withLock { $0 } }
+    public func recordReadStatus(_ status: SelectionReadStatus) { readStatus.withLock { $0 = status } }
+
+    private let metrics = OSAllocatedUnfairLock<[String: UInt64]>(initialState: [:])
+    private let restored = OSAllocatedUnfairLock<Bool?>(initialState: nil)
+
+    public func addMetric(_ key: String, _ value: UInt64 = 1) {
+        metrics.withLock { $0[key, default: 0] += value }
+    }
+
+    public func recordClipboardRestored(_ value: Bool) { restored.withLock { $0 = value } }
+
+    public func complete(status: SelectionReadStatus, configured: SelectionStrategy, winner: SelectionStrategy?, bundleID: String? = nil) {
+        var fields: [String: FieldValue] = [
+            "bundleID": .token(bundleID ?? "unknown"),
+            "outcome": .token(status.rawValue), "trigger": .token(trigger.raw),
+            "configuredStrategy": .token(configured.rawValue),
+            "winningStrategy": .token(winner?.rawValue ?? "none"),
+            "elapsedMicros": .micros(UInt32(clamping: elapsedMicros))
+        ]
+        for (key, value) in metrics.withLock({ $0 }) {
+            fields[key] = .int(Int64(clamping: value))
+        }
+        if let value = restored.withLock({ $0 }) { fields["clipboardRestored"] = .bool(value) }
+        if let target = recordedTarget.withLock({ $0 }) {
+            fields["bundleID"] = .token(target.bundleID ?? "unknown")
+        }
+        let attempts = recordedAttempts.withLock { $0 }
+        fields["attempts"] = .int(Int64(attempts.count))
+        if let first = attempts.first, attempts.count > 1 {
+            let reason: String
+            switch first.outcome {
+            case .empty(let value): reason = String(describing: value)
+            case .timedOut: reason = "timedOut"
+            case .failed: reason = "failed"
+            case .skipped: reason = "skipped"
+            case .cancelled: reason = "cancelled"
+            case .succeeded: reason = "richEnrichment"
+            }
+            fields["fallbackReason"] = .token(reason)
+        }
+        let level: LogLevel = status == .selection ? .info
+            : (status == .timedOut || status == .failed || status == .targetChanged ? .warning
+                : (status == .cancelled ? .trace : .debug))
+        log(level, .cascade, "selection completed", fields: fields)
+    }
+
     public func buildReport(outcome: FinalOutcome) -> CascadeReport {
         let attempts = recordedAttempts.withLock { $0 }
         let target = recordedTarget.withLock { $0 }
@@ -111,7 +162,10 @@ public final class SelectionTrace: Sendable {
             totalMicros: total,
             outcome: outcome,
             attempts: attempts,
-            dropped: 0
+            dropped: 0,
+            readStatus: selectionReadStatus,
+            metrics: metrics.withLock { $0 },
+            clipboardRestored: restored.withLock { $0 }
         )
     }
 }

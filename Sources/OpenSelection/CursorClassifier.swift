@@ -36,11 +36,14 @@ public struct CursorClassifier {
               cgImage.bitsPerPixel == 32,
               cgImage.bitsPerComponent == 8,
               let data = cgImage.dataProvider?.data,
+              CFDataGetLength(data) >= cgImage.bytesPerRow * cgImage.height,
               let pixels = CFDataGetBytePtr(data),
               let alphaOffset = alphaByteOffset(cgImage) else {
             return .unknown
         }
 
+        // Retain the backing bytes through all pixel reads (also present in 2.15.1).
+        defer { withExtendedLifetime(data) {} }
         let width = cgImage.width
         let height = cgImage.height
         let bytesPerRow = cgImage.bytesPerRow

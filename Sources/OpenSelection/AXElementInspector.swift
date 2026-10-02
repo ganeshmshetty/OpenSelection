@@ -92,7 +92,7 @@ public struct AXElementInspector {
     /// element. Reading `kAXFocusedUIElementAttribute` directly off the system-wide element
     /// is the classic source of stale or missing selection reads.
     public static func inspect(ancestorDepth: Int = ancestorWalkDepth, trace: SelectionTrace? = nil) -> Target {
-        trace?.log(.debug, .ax, "ax inspect started")
+        trace?.log(.trace, .ax, "ax inspect started")
         let systemWide = AXUIElementCreateSystemWide()
 
         // 1. Focused application — from the system-wide element.

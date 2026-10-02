@@ -137,6 +137,10 @@ public final class DiagnosticsHub: Sendable {
         fields: [String: FieldValue] = [:]
     ) {
         guard isEnabled(level) else { return }
+        if let trace = SelectionTrace.current {
+            trace.log(level, category, message, fields: fields)
+            return
+        }
         let event = DiagnosticEvent(
             traceID: TraceID(rawValue: 0),
             level: level,

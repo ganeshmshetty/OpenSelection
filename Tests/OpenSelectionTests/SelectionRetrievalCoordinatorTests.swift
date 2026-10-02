@@ -1268,7 +1268,7 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
         XCTAssertEqual(second?.text, "overlap text", "second overlapping gesture must not be dropped")
     }
 
-    func testInspectPermitFreesAtWatchdogDeadlineWhileWorkerStillHung() async {
+    func testFreshInspectUsesRemainingCapacityWhileWorkerStillHung() async {
         let zombieUnblock = DispatchSemaphore(value: 0)
         defer { zombieUnblock.signal() }
         let hungCoordinator = SelectionRetrievalCoordinator(
@@ -1301,6 +1301,17 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
                        "permit must be usable again right after the watchdog deadline")
 
         zombieUnblock.signal()
+    }
+
+    func testRejectsAXSnapshotFromAnotherProcess() async {
+        let coordinator = SelectionRetrievalCoordinator(inspect: {
+            AXElementInspector.Target(focusedApp: AXUIElementCreateApplication(2002),
+                                      role: "AXTextField", selectedText: "wrong app text")
+        })
+        let result = await coordinator.retrieve(
+            for: AppIdentity(bundleIdentifier: "com.test.app", processIdentifier: 1001),
+            policy: .default, cursor: .unknown)
+        XCTAssertNil(result)
     }
 
     func testConcurrencyCapFailsFastWhenSaturated() async {
@@ -1349,7 +1360,7 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
         }
     }
 
-    func testMenuCopyPressPermitFreesAtWatchdogDeadlineWhileWorkerStillHung() async {
+    func testFreshInspectUsesRemainingCapacityWhileMenuWorkerStillHung() async {
         let pressStarted = expectation(description: "hung menu press started")
         let zombieUnblock = DispatchSemaphore(value: 0)
         defer { zombieUnblock.signal() }
@@ -1394,7 +1405,7 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
                        "permit must be usable again right after the press watchdog deadline")
     }
 
-    func testFourHungMenuCopyPressesDoNotPermanentlyLockOutInspect() async {
+    func testHungMenuWorkersHoldPermitsUntilTheyExit() async {
         let starts = PressStartSignal()
         let maxConcurrent = SelectionConfiguration.default.axMaxConcurrentInspects
         let zombieUnblock = DispatchSemaphore(value: 0)
@@ -1443,6 +1454,13 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
 
         try? await Task.sleep(nanoseconds: UInt64((hungCoordinator.configuration.axReadTimeout + 0.1) * 1_000_000_000))
 
+        let stillBlocked = await freshCoordinator.retrieve(
+            for: AppIdentity(bundleIdentifier: "com.test.app"), policy: inspectPolicy, cursor: .unknown
+        )
+        XCTAssertNil(stillBlocked, "Timed-out workers must continue to hold the cap")
+        for _ in 0..<maxConcurrent { zombieUnblock.signal() }
+        // Allow the returning workers to execute their permit-release defer.
+        try? await Task.sleep(nanoseconds: 50_000_000)
         let recoveredStart = Date()
         let recovered = await freshCoordinator.retrieve(
             for: AppIdentity(bundleIdentifier: "com.test.app"),
@@ -1453,6 +1471,7 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
                           "inspect must not stay locked out after press watchdogs fire")
         XCTAssertEqual(recovered?.text, "fresh")
 
+        for _ in 0..<maxConcurrent { zombieUnblock.signal() }
         for task in hungTasks { _ = await task.value }
     }
 

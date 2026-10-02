@@ -19,6 +19,49 @@ final class DiagnosticsPipelineTests: XCTestCase {
         super.tearDown()
     }
 
+    func testSuccessfulFallbackProducesOneNormalSummaryWithoutPollingNoise() async throws {
+        let sink = SelectionLogTestSink(minimumLevel: .debug)
+        DiagnosticsHub.shared.removeAllSinks()
+        DiagnosticsHub.shared.install(sink)
+        let reader = SelectionRetrievalCoordinator(
+            configuration: SelectionConfiguration(webAreaSettleInterval: 0.001, webAreaSettleMaxRetries: 3),
+            inspect: { _ in AXElementInspector.Target(role: "AXWebArea", selectedText: "") },
+            detailedCopyCapture: { _ in .init(result: SelectionResult(text: "PRIVATE_CANARY", strategy: .keyboardCopy), status: .selection) })
+        let response = await reader.retrieveResponse(for: AppIdentity(bundleIdentifier: "com.test"),
+            requireCopyEvidence: false, trigger: .dragEnd)
+        await DiagnosticsHub.shared.flush()
+        let events = sink.events.withLock { $0 }
+        XCTAssertEqual(events.count, 1)
+        let summary = try XCTUnwrap(events.first)
+        XCTAssertEqual(summary.message, "selection completed")
+        XCTAssertEqual(summary.level, .info)
+        XCTAssertEqual(summary.traceID.rawValue, response.traceID)
+        XCTAssertEqual(summary.fields["configuredStrategy"], .token("ax-text-control"))
+        XCTAssertEqual(summary.fields["winningStrategy"], .token("keyboard-copy"))
+        XCTAssertEqual(summary.fields["trigger"], .token("dragEnd"))
+        XCTAssertEqual(summary.fields["webAreaRetries"], .int(2))
+        XCTAssertEqual(summary.fields["fallbackReason"], .token("noSelection"))
+        XCTAssertFalse(String(describing: events).contains("PRIVATE_CANARY"))
+    }
+
+    func testVerboseCaptureEventsInheritRequestTraceAndContextDoesNotLeak() async {
+        let sink = SelectionLogTestSink(minimumLevel: .trace)
+        DiagnosticsHub.shared.removeAllSinks()
+        DiagnosticsHub.shared.install(sink)
+        let reader = SelectionRetrievalCoordinator(
+            inspect: { _ in AXElementInspector.Target() },
+            detailedCopyCapture: { _ in
+                await Task { DiagnosticsHub.shared.log(.trace, .pasteboard, "capture detail") }.value
+                return .init(result: SelectionResult(text: "text", strategy: .keyboardCopy), status: .selection)
+            })
+        let response = await reader.retrieveResponse()
+        await DiagnosticsHub.shared.flush()
+        let events = sink.events.withLock { $0 }
+        XCTAssertTrue(events.contains { $0.message == "capture detail" })
+        XCTAssertTrue(events.allSatisfy { $0.traceID.rawValue == response.traceID })
+        XCTAssertNil(SelectionTrace.current)
+    }
+
     func testLogLevelOrdering() {
         XCTAssertLessThan(LogLevel.trace, LogLevel.debug)
         XCTAssertLessThan(LogLevel.debug, LogLevel.info)
@@ -139,4 +182,12 @@ final class DiagnosticsPipelineTests: XCTestCase {
         let msgs = received.withLock { $0 }
         XCTAssertTrue(msgs.contains(where: { $0.contains("test legacy message") }))
     }
+}
+
+
+private final class SelectionLogTestSink: OpenSelectionDiagnosticsSink, Sendable {
+    let minimumLevel: LogLevel
+    let events = OSAllocatedUnfairLock<[DiagnosticEvent]>(initialState: [])
+    init(minimumLevel: LogLevel) { self.minimumLevel = minimumLevel }
+    func record(_ event: DiagnosticEvent) { events.withLock { $0.append(event) } }
 }

@@ -6,6 +6,7 @@
 import AppKit
 import ApplicationServices
 import Foundation
+import os
 
 public struct PasteAvailabilityProbe: Sendable {
     public typealias Lookup = @Sendable (_ pid: pid_t, _ deadline: Date?) -> Bool?
@@ -61,16 +62,12 @@ public struct PasteAvailabilityProbe: Sendable {
 
     private actor ProbeConcurrencyGate {
         private var inFlight = 0
-
         func tryAcquire(limit: Int) -> Bool {
             guard inFlight < limit else { return false }
             inFlight += 1
             return true
         }
-
-        func release() {
-            inFlight -= 1
-        }
+        func release() { inFlight -= 1 }
     }
     private static let probeGate = ProbeConcurrencyGate()
 
@@ -89,7 +86,6 @@ public struct PasteAvailabilityProbe: Sendable {
             watchdog.set(Task {
                 try? await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
                 if resume.resume(continuation, with: nil) {
-                    Task.detached { await Self.probeGate.release() }
                     DiagnosticsHub.shared.log(.warning, .pasteboard, "paste probe lookup deadline exceeded", fields: [
                         "pid": .int(Int64(pid)),
                         "timeoutMicros": .micros(UInt32(timeoutSeconds * 1_000_000))
@@ -99,9 +95,9 @@ public struct PasteAvailabilityProbe: Sendable {
 
             Self.axProbeQueue.async {
                 let enabled = lookup(pid, deadline)
-                if resume.resume(continuation, with: enabled) {
-                    watchdog.cancel()
-                    Task.detached { await Self.probeGate.release() }
+                Task {
+                    await Self.probeGate.release()
+                    if resume.resume(continuation, with: enabled) { watchdog.cancel() }
                 }
             }
         }

@@ -47,6 +47,9 @@ public enum OpenSelection: Sendable {
     public typealias OpenSelectionMonitor = OpenSelectionMonitorType
     public typealias PasteProbe = OpenSelectionPasteAvailabilityProbe
     public typealias PasteAvailabilityProbe = OpenSelectionPasteAvailabilityProbe
+    public typealias ClipboardCoordinator = PasteboardCoordinator
+    public typealias ClipboardSession = PasteboardSession
+    public typealias ClipboardPriority = PasteboardOperationPriority
     public typealias LogLevel = DiagnosticsLogLevel
     public typealias LogCategory = DiagnosticsLogCategory
     public typealias FieldValue = DiagnosticsFieldValue
@@ -195,11 +198,17 @@ public enum OpenSelection: Sendable {
         matchStyle: Bool = false,
         restorePasteboard: Bool = true,
         pasteboard: NSPasteboard = .general,
-        configuration: SelectionConfiguration? = nil
+        configuration: SelectionConfiguration? = nil,
+        keyPoster: SelectionReplacer.KeyPoster? = nil,
+        appActivator: SelectionReplacer.AppActivator? = nil,
+        targetActiveChecker: SelectionReplacer.TargetActiveChecker? = nil
     ) async throws {
         let replacer = SelectionReplacer(
             configuration: configuration ?? Self.configuration,
-            pasteboard: pasteboard
+            pasteboard: pasteboard,
+            keyPoster: keyPoster ?? { KeyboardEventPoster.postKey(keyCode: $0, flags: $1) },
+            appActivator: appActivator ?? { $0.activate() },
+            targetActiveChecker: targetActiveChecker ?? SelectionReplacer.defaultTargetActiveChecker
         )
         try await replacer.replace(
             with: text,

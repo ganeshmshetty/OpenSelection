@@ -148,6 +148,9 @@ public struct CascadeReport: Sendable, Codable, Equatable {
     public let outcome: FinalOutcome
     public let attempts: [StrategyAttempt]
     public let dropped: Int
+    public let readStatus: SelectionReadStatus?
+    public let metrics: [String: UInt64]?
+    public let clipboardRestored: Bool?
 
     public init(
         schemaVersion: Int = CascadeReport.currentSchemaVersion,
@@ -157,7 +160,10 @@ public struct CascadeReport: Sendable, Codable, Equatable {
         totalMicros: UInt32,
         outcome: FinalOutcome,
         attempts: [StrategyAttempt] = [],
-        dropped: Int = 0
+        dropped: Int = 0,
+        readStatus: SelectionReadStatus? = nil,
+        metrics: [String: UInt64]? = nil,
+        clipboardRestored: Bool? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.traceID = traceID
@@ -167,5 +173,8 @@ public struct CascadeReport: Sendable, Codable, Equatable {
         self.outcome = outcome
         self.attempts = attempts
         self.dropped = dropped
+        self.readStatus = readStatus
+        self.metrics = metrics
+        self.clipboardRestored = clipboardRestored
     }
 }

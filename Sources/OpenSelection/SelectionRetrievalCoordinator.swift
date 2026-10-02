@@ -50,6 +50,7 @@ public struct SelectionRetrievalCoordinator: Sendable {
     public typealias SimpleTargetProvider = @Sendable () -> AXElementInspector.Target
     public typealias CopyTrigger = PasteboardCopyEngine.CopyTrigger
     public typealias LegacyCopyCapture = @Sendable (@escaping CopyTrigger) async -> SelectionResult?
+    public typealias DetailedCopyCapture = @Sendable (CopyRequest) async -> SelectionReadResponse
     public typealias CopyCapture = @Sendable (CopyRequest) async -> SelectionResult?
     public typealias MenuPress = @Sendable (AXUIElement?) -> Void
     public typealias ScriptRunner = @Sendable (String) async throws -> String
@@ -67,15 +68,13 @@ public struct SelectionRetrievalCoordinator: Sendable {
             inFlight += 1
             return true
         }
-        func release() {
-            inFlight -= 1
-        }
+        func release() { inFlight -= 1 }
     }
     private static let inspectGate = InspectConcurrencyGate()
 
     public let configuration: SelectionConfiguration
     private let inspect: TargetProvider
-    private let copyCapture: CopyCapture
+    private let copyCapture: DetailedCopyCapture
     private let menuPress: MenuPress
     private let scriptRunner: ScriptRunner
 
@@ -84,13 +83,23 @@ public struct SelectionRetrievalCoordinator: Sendable {
         configuration: SelectionConfiguration = .default,
         inspect: @escaping TargetProvider = { trace in AXElementInspector.inspect(trace: trace) },
         copyCapture: CopyCapture? = nil,
+        detailedCopyCapture: DetailedCopyCapture? = nil,
         menuPress: @escaping MenuPress = Self.pressEditCopyMenu,
         scriptRunner: @escaping ScriptRunner = Self.defaultScriptRunner
     ) {
         self.configuration = configuration
         self.inspect = inspect
-        self.copyCapture = copyCapture ?? { request in
-            await PasteboardCopyEngine(configuration: configuration).capture(trigger: request.trigger)
+        if let detailedCopyCapture {
+            self.copyCapture = detailedCopyCapture
+        } else if let copyCapture {
+            self.copyCapture = { request in
+                let result = await copyCapture(request)
+                return SelectionReadResponse(result: result, status: Task.isCancelled ? .cancelled : (result == nil ? .noSelection : .selection))
+            }
+        } else {
+            self.copyCapture = { request in
+                await PasteboardCopyEngine(configuration: configuration).captureResponse(trigger: request.trigger)
+            }
         }
         self.menuPress = menuPress
         self.scriptRunner = scriptRunner
@@ -101,6 +110,7 @@ public struct SelectionRetrievalCoordinator: Sendable {
         configuration: SelectionConfiguration = .default,
         inspect: @escaping SimpleTargetProvider,
         copyCapture: CopyCapture? = nil,
+        detailedCopyCapture: DetailedCopyCapture? = nil,
         menuPress: @escaping MenuPress = Self.pressEditCopyMenu,
         scriptRunner: @escaping ScriptRunner = Self.defaultScriptRunner
     ) {
@@ -108,6 +118,7 @@ public struct SelectionRetrievalCoordinator: Sendable {
             configuration: configuration,
             inspect: { _ in inspect() },
             copyCapture: copyCapture,
+            detailedCopyCapture: detailedCopyCapture,
             menuPress: menuPress,
             scriptRunner: scriptRunner
         )
@@ -118,6 +129,7 @@ public struct SelectionRetrievalCoordinator: Sendable {
         configuration: SelectionConfiguration = .default,
         inspectWithTrace: @escaping TargetProvider,
         copyCapture: CopyCapture? = nil,
+        detailedCopyCapture: DetailedCopyCapture? = nil,
         menuPress: @escaping MenuPress = Self.pressEditCopyMenu,
         scriptRunner: @escaping ScriptRunner = Self.defaultScriptRunner
     ) {
@@ -125,6 +137,7 @@ public struct SelectionRetrievalCoordinator: Sendable {
             configuration: configuration,
             inspect: inspectWithTrace,
             copyCapture: copyCapture,
+            detailedCopyCapture: detailedCopyCapture,
             menuPress: menuPress,
             scriptRunner: scriptRunner
         )
@@ -217,7 +230,7 @@ public struct SelectionRetrievalCoordinator: Sendable {
     // MARK: - Retrieval Methods
 
     /// Reads the current selection and context details for an app under `policy`.
-    public func retrieveDetails(
+    public func retrieveResponse(
         for app: AppIdentity = AppIdentity(),
         policy: SelectionPolicy = .default,
         cursor: CursorClass = .unknown,
@@ -226,28 +239,63 @@ public struct SelectionRetrievalCoordinator: Sendable {
         requireCopyEvidence: Bool = true,
         trigger: TriggerSource = .programmatic,
         trace: SelectionTrace? = nil
-    ) async -> (result: SelectionResult?, isEditable: Bool) {
+    ) async -> SelectionReadResponse {
+        let activeTrace = trace ?? SelectionTrace.create(trigger: trigger)
+        return await SelectionTrace.$current.withValue(activeTrace) {
+            await retrieveTraced(for: app, policy: policy, cursor: cursor,
+                isSelectAll: isSelectAll, allowCopyFallback: allowCopyFallback,
+                requireCopyEvidence: requireCopyEvidence, trigger: trigger, trace: activeTrace)
+        }
+    }
+
+    private func retrieveTraced(
+        for app: AppIdentity = AppIdentity(),
+        policy: SelectionPolicy = .default,
+        cursor: CursorClass = .unknown,
+        isSelectAll: Bool = false,
+        allowCopyFallback: Bool = true,
+        requireCopyEvidence: Bool = true,
+        trigger: TriggerSource = .programmatic,
+        trace: SelectionTrace? = nil
+    ) async -> SelectionReadResponse {
         let activeTrace = trace ?? SelectionTrace.create(trigger: trigger)
         let bundleID = app.bundleIdentifier ?? "unknown"
-        activeTrace.log(.debug, .cascade, "retrieval started", fields: [
+        func finish(_ result: SelectionResult? = nil, _ editable: Bool = false,
+                    _ status: SelectionReadStatus) -> SelectionReadResponse {
+            activeTrace.recordReadStatus(status)
+            activeTrace.complete(status: status, configured: policy.retrievalMode, winner: result?.strategy, bundleID: app.bundleIdentifier)
+            let final: FinalOutcome = status == .cancelled ? .cancelled
+                : result.map { .selection(strategy: $0.strategy, presence: .nonEmpty) } ?? .none
+            let report = activeTrace.buildReport(outcome: final)
+            if trace != nil || DiagnosticsHub.shared.isReportRequired(outcome: final, elapsedMicros: activeTrace.elapsedMicros) {
+                DiagnosticsHub.shared.emitReport(report)
+                return SelectionReadResponse(result: result?.withDiagnostics(report), isEditable: editable, status: status, traceID: activeTrace.id.rawValue)
+            }
+            return SelectionReadResponse(result: result, isEditable: editable, status: status, traceID: activeTrace.id.rawValue)
+        }
+        if Task.isCancelled { return finish(nil, false, .cancelled) }
+        if policy.disabled { return finish(nil, false, .policyBlocked) }
+
+        activeTrace.log(.trace, .cascade, "retrieval started", fields: [
             "bundleID": .token(bundleID),
             "cursor": .token(cursor.rawValue)
         ])
 
         let target = await inspectWithWatchdog(trace: activeTrace)
         guard let target else {
-            activeTrace.log(.warning, .ax, "ax inspect timed out", fields: [
+            activeTrace.log(.trace, .ax, "ax inspect returned no target", fields: [
                 "bundleID": .token(bundleID)
             ])
-            if trace != nil || DiagnosticsHub.shared.isReportRequired(outcome: FinalOutcome.none, elapsedMicros: activeTrace.elapsedMicros) {
-                let report = activeTrace.buildReport(outcome: FinalOutcome.none)
-                DiagnosticsHub.shared.emitReport(report)
-            }
-            return (nil, false)
+            return finish(nil, false, Task.isCancelled ? .cancelled : activeTrace.selectionReadStatus)
         }
 
         let isEditable = Self.isEditableContext(target)
 
+        if let requestedPID = app.processIdentifier, let focusedApp = target.focusedApp {
+            var inspectedPID: pid_t = 0
+            guard AXUIElementGetPid(focusedApp, &inspectedPID) == .success,
+                  inspectedPID == requestedPID else { return finish(nil, false, .targetChanged) }
+        }
         var targetPID: pid_t = app.processIdentifier ?? 0
         if targetPID == 0, let axApp = target.focusedApp {
             var pid: pid_t = 0
@@ -303,11 +351,7 @@ public struct SelectionRetrievalCoordinator: Sendable {
                     "bundleID": .token(bundleID),
                     "role": .token(role)
                 ])
-                if trace != nil || DiagnosticsHub.shared.isReportRequired(outcome: FinalOutcome.none, elapsedMicros: activeTrace.elapsedMicros) {
-                    let report = activeTrace.buildReport(outcome: FinalOutcome.none)
-                    DiagnosticsHub.shared.emitReport(report)
-                }
-                return (nil, isEditable)
+                return finish(nil, isEditable, .copyBlocked)
             }
         }
 
@@ -317,24 +361,16 @@ public struct SelectionRetrievalCoordinator: Sendable {
                 "bundleID": .token(bundleID),
                 "cursor": .token(cursor.rawValue)
             ])
-            if trace != nil || DiagnosticsHub.shared.isReportRequired(outcome: FinalOutcome.none, elapsedMicros: activeTrace.elapsedMicros) {
-                let report = activeTrace.buildReport(outcome: FinalOutcome.none)
-                DiagnosticsHub.shared.emitReport(report)
-            }
-            return (nil, isEditable)
+            return finish(nil, isEditable, .copyBlocked)
         }
 
         // Whole-container select gesture (⌘A, ⌘L) landing on a row selection (Finder, Mail, table views)
         if isSelectAll, Self.isRowSelectionContext(target) {
             activeTrace.log(.debug, .gate, "select-all on row-selection element skipped")
-            if trace != nil || DiagnosticsHub.shared.isReportRequired(outcome: FinalOutcome.none, elapsedMicros: activeTrace.elapsedMicros) {
-                let report = activeTrace.buildReport(outcome: FinalOutcome.none)
-                DiagnosticsHub.shared.emitReport(report)
-            }
-            return (nil, isEditable)
+            return finish(nil, isEditable, .copyBlocked)
         }
 
-        activeTrace.log(.debug, .cascade, "gate passed", fields: [
+        activeTrace.log(.trace, .cascade, "gate passed", fields: [
             "bundleID": .token(bundleID),
             "strategy": .token(policy.retrievalMode.rawValue)
         ])
@@ -371,21 +407,22 @@ public struct SelectionRetrievalCoordinator: Sendable {
             trace: activeTrace
         ))
 
-        let finalOutcome: FinalOutcome
-        if let readResult {
-            finalOutcome = .selection(strategy: readResult.strategy, presence: .nonEmpty)
-        } else {
-            finalOutcome = .none
-        }
+        if Task.isCancelled { return finish(nil, isEditable, .cancelled) }
+        if activeTrace.selectionReadStatus == .targetChanged { return finish(nil, isEditable, .targetChanged) }
+        return finish(readResult, isEditable, readResult == nil ? activeTrace.selectionReadStatus : .selection)
+    }
 
-        if trace != nil || DiagnosticsHub.shared.isReportRequired(outcome: finalOutcome, elapsedMicros: activeTrace.elapsedMicros) {
-            let report = activeTrace.buildReport(outcome: finalOutcome)
-            DiagnosticsHub.shared.emitReport(report)
-            let resultWithDiagnostics = readResult?.withDiagnostics(report)
-            return (resultWithDiagnostics, isEditable)
-        } else {
-            return (readResult, isEditable)
-        }
+    /// Compatibility projection. New callers should use retrieveResponse to retain reasons.
+    public func retrieveDetails(
+        for app: AppIdentity = AppIdentity(), policy: SelectionPolicy = .default,
+        cursor: CursorClass = .unknown, isSelectAll: Bool = false,
+        allowCopyFallback: Bool = true, requireCopyEvidence: Bool = true,
+        trigger: TriggerSource = .programmatic, trace: SelectionTrace? = nil
+    ) async -> (result: SelectionResult?, isEditable: Bool) {
+        let response = await retrieveResponse(for: app, policy: policy, cursor: cursor,
+            isSelectAll: isSelectAll, allowCopyFallback: allowCopyFallback,
+            requireCopyEvidence: requireCopyEvidence, trigger: trigger, trace: trace)
+        return (response.result, response.isEditable)
     }
 
     /// Convenience for NSRunningApplication.
@@ -471,6 +508,7 @@ public struct SelectionRetrievalCoordinator: Sendable {
         let bundleID = app.bundleIdentifier ?? "unknown"
         var strategies = strategyCascade(for: policy, target: target, bundleIdentifier: app.bundleIdentifier)
         if !allowCopyFallback {
+            if strategies.contains(.keyboardCopy) || strategies.contains(.menuCopy) { trace.recordReadStatus(.copyBlocked) }
             let nonCopy = strategies.filter { $0 != .keyboardCopy && $0 != .menuCopy }
             if nonCopy.isEmpty {
                 // The overlay gate forbids the synthetic ⌘C, not reading. An app whose cascade is
@@ -479,17 +517,18 @@ public struct SelectionRetrievalCoordinator: Sendable {
                 // post no events, so degrading to them keeps the gate's promise and can still read
                 // the selection (Electron/web views expose it via AXWebArea).
                 strategies = [.axTextControl, .axWebArea]
-                trace.log(.debug, .gate, "overlay gate active, trying ax only", fields: ["bundleID": .token(bundleID)])
+                trace.log(.trace, .gate, "overlay gate active, trying ax only", fields: ["bundleID": .token(bundleID)])
             } else {
                 strategies = nonCopy
             }
         }
 
         for (index, strategy) in strategies.enumerated() {
+            guard !Task.isCancelled else { trace.recordReadStatus(.cancelled); return nil }
             let attemptStart = UInt32(min(UInt64(UInt32.max), trace.elapsedMicros))
             if index > 0 {
                 let previous = strategies[index - 1]
-                trace.log(.debug, .cascade, "strategy fallback", fields: [
+                trace.log(.trace, .cascade, "strategy fallback", fields: [
                     "bundleID": .token(bundleID),
                     "fromStrategy": .token(previous.rawValue),
                     "toStrategy": .token(strategy.rawValue)
@@ -514,13 +553,14 @@ public struct SelectionRetrievalCoordinator: Sendable {
                             trace: trace
                         )
                         evidence = ev
-                        trace.log(.debug, .gate, "copy strategy permitted", fields: [
+                        trace.log(.trace, .gate, "copy strategy permitted", fields: [
                             "bundleID": .token(bundleID),
                             "strategy": .token(strategy.rawValue),
                             "evidence": .token(ev.reason)
                         ])
                     } else {
-                        trace.log(.debug, .gate, "copy strategy skipped, no evidence", fields: [
+                        trace.recordReadStatus(.copyBlocked)
+                        trace.log(.trace, .gate, "copy strategy skipped, no evidence", fields: [
                             "bundleID": .token(bundleID),
                             "strategy": .token(strategy.rawValue)
                         ])
@@ -538,6 +578,9 @@ public struct SelectionRetrievalCoordinator: Sendable {
                 }
             }
             let (rawResult, outcome) = await run(strategy, app: app, target: target, evidence: evidence, trace: trace)
+            if trace.selectionReadStatus == .targetChanged || trace.selectionReadStatus == .cancelled {
+                return nil
+            }
             if let result = Self.nonBlank(rawResult) {
                 let duration = UInt32(min(UInt64(UInt32.max), trace.elapsedMicros - UInt64(attemptStart)))
                 trace.recordAttempt(StrategyAttempt(
@@ -547,12 +590,12 @@ public struct SelectionRetrievalCoordinator: Sendable {
                     durationMicros: duration
                 ))
                 if index > 0 {
-                    trace.log(.info, .cascade, "fallback strategy succeeded", fields: [
+                    trace.log(.trace, .cascade, "fallback strategy succeeded", fields: [
                         "bundleID": .token(bundleID),
                         "strategy": .token(strategy.rawValue)
                     ])
                 } else {
-                    trace.log(.info, .cascade, "primary strategy succeeded", fields: [
+                    trace.log(.trace, .cascade, "primary strategy succeeded", fields: [
                         "bundleID": .token(bundleID),
                         "strategy": .token(strategy.rawValue)
                     ])
@@ -566,6 +609,12 @@ public struct SelectionRetrievalCoordinator: Sendable {
                     trace: trace
                 )
             } else {
+                switch outcome {
+                case .timedOut: trace.recordReadStatus(.timedOut)
+                case .cancelled: trace.recordReadStatus(.cancelled)
+                case .failed: trace.recordReadStatus(.failed)
+                default: break
+                }
                 let duration = UInt32(min(UInt64(UInt32.max), trace.elapsedMicros - UInt64(attemptStart)))
                 trace.recordAttempt(StrategyAttempt(
                     strategy: strategy,
@@ -575,7 +624,7 @@ public struct SelectionRetrievalCoordinator: Sendable {
                 ))
             }
         }
-        trace.log(.info, .cascade, "all strategies exhausted", fields: ["bundleID": .token(bundleID)])
+        trace.log(.trace, .cascade, "all strategies exhausted", fields: ["bundleID": .token(bundleID)])
         return nil
     }
 
@@ -718,6 +767,8 @@ public struct SelectionRetrievalCoordinator: Sendable {
             return (nil, .empty(.noSelection))
 
         case .axWebArea:
+            let phaseStart = trace?.elapsedMicros ?? 0
+            defer { if let trace { trace.addMetric("webAreaMicros", trace.elapsedMicros - phaseStart) } }
             var snapshot: AXElementInspector.Target? = target
             var attempts = 0
             while attempts < configuration.webAreaSettleMaxRetries {
@@ -726,6 +777,7 @@ public struct SelectionRetrievalCoordinator: Sendable {
                 }
                 attempts += 1
                 if attempts < configuration.webAreaSettleMaxRetries {
+                    trace?.addMetric("webAreaRetries")
                     try? await Task.sleep(nanoseconds: UInt64(configuration.webAreaSettleInterval * 1_000_000_000))
                     if let element = snapshot?.webArea ?? snapshot?.focusedElement,
                        let result = AXWebAreaStrategy.pollFresh(from: element) {
@@ -734,7 +786,7 @@ public struct SelectionRetrievalCoordinator: Sendable {
                     snapshot = await inspectWithWatchdog(trace: trace)
                 }
             }
-            return (nil, attempts > 0 ? .timedOut : .empty(.noSelection))
+            return (nil, .empty(.noSelection))
 
         case .officeScript:
             return await runOfficeScript(for: app, target: target, trace: trace)
@@ -751,12 +803,11 @@ public struct SelectionRetrievalCoordinator: Sendable {
                 let maxConcurrent = configuration.axMaxConcurrentInspects
                 trigger = {
                     Task.detached {
-                        await Self.pressCopyMenuWithWatchdog(
-                            app: target.focusedApp,
-                            press: press,
-                            timeout: timeout,
-                            maxConcurrent: maxConcurrent
-                        )
+                        await SelectionTrace.$current.withValue(trace) {
+                            await Self.pressCopyMenuWithWatchdog(
+                                app: target.focusedApp, press: press,
+                                timeout: timeout, maxConcurrent: maxConcurrent)
+                        }
                     }
                 }
             case .keyboardCopy:
@@ -766,8 +817,14 @@ public struct SelectionRetrievalCoordinator: Sendable {
                 return (nil, .empty(.noSelection))
             }
             let request = CopyRequest(trigger: trigger, evidence: evidence ?? CopyEvidence("unspecified", .weak))
-            guard let captured = await copyCapture(request) else {
-                return (nil, Task.isCancelled ? .cancelled : .empty(.noSelection))
+            let response = await copyCapture(request)
+            guard let captured = response.result else {
+                trace?.recordReadStatus(response.status)
+                switch response.status {
+                case .cancelled: return (nil, .cancelled)
+                case .timedOut: return (nil, .timedOut)
+                default: return (nil, .empty(.noSelection))
+                }
             }
             let res = SelectionResult(
                 text: captured.text,
@@ -864,7 +921,11 @@ public struct SelectionRetrievalCoordinator: Sendable {
     // MARK: - Watchdog AX Workers
 
     private func inspectWithWatchdog(trace: SelectionTrace? = nil) async -> AXElementInspector.Target? {
+        let phaseStart = trace?.elapsedMicros ?? 0
+        trace?.addMetric("axInspects")
+        defer { if let trace { trace.addMetric("axInspectMicros", trace.elapsedMicros - phaseStart) } }
         guard await Self.inspectGate.tryAcquire(limit: configuration.axMaxConcurrentInspects) else {
+            trace?.recordReadStatus(.busy)
             trace?.log(.warning, .ax, "inspect concurrency cap reached")
             return nil
         }
@@ -876,8 +937,7 @@ public struct SelectionRetrievalCoordinator: Sendable {
 
             timeout.set(Task {
                 try? await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
-                if resume.resume(continuation, with: nil) {
-                    Task.detached { await Self.inspectGate.release() }
+                if resume.resume(continuation, with: nil, beforeResume: { trace?.recordReadStatus(.timedOut) }) {
                     trace?.log(.warning, .ax, "ax inspect deadline exceeded", fields: [
                         "timeoutMicros": .micros(UInt32(timeoutSeconds * 1_000_000))
                     ])
@@ -886,9 +946,9 @@ public struct SelectionRetrievalCoordinator: Sendable {
 
             Self.axInspectQueue.async {
                 let target = inspect(trace)
-                if resume.resume(continuation, with: target) {
-                    timeout.cancel()
-                    Task.detached { await Self.inspectGate.release() }
+                Task {
+                    await Self.inspectGate.release()
+                    if resume.resume(continuation, with: target) { timeout.cancel() }
                 }
             }
         }
@@ -905,40 +965,25 @@ public struct SelectionRetrievalCoordinator: Sendable {
         }
 
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            let isSettled = OSAllocatedUnfairLock(initialState: false)
+            let resume = OnceResume<Void>()
             let watchdog = TaskBox()
-
-            let finishOperation: @Sendable (Bool) -> Void = { didTimeout in
-                let shouldRelinquish = isSettled.withLock { settled -> Bool in
-                    guard !settled else { return false }
-                    settled = true
-                    return true
-                }
-                guard shouldRelinquish else { return }
-
-                if didTimeout {
-                    DiagnosticsHub.shared.log(.warning, .ax, "menu press deadline exceeded", fields: [
-                        "timeoutMicros": .micros(UInt32(timeout * 1_000_000))
-                    ])
-                } else {
-                    watchdog.cancel()
-                }
-
-                Task.detached {
-                    await inspectGate.release()
-                }
-                continuation.resume()
-            }
 
             watchdog.set(Task {
                 try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                finishOperation(true)
+                if resume.resume(continuation, with: ()) {
+                    DiagnosticsHub.shared.log(.warning, .ax, "menu press deadline exceeded", fields: [
+                        "timeoutMicros": .micros(UInt32(timeout * 1_000_000))
+                    ])
+                }
             })
 
             nonisolated(unsafe) let element = app
             axInspectQueue.async {
                 press(element)
-                finishOperation(false)
+                Task {
+                    await inspectGate.release()
+                    if resume.resume(continuation, with: ()) { watchdog.cancel() }
+                }
             }
         }
     }
@@ -1054,8 +1099,11 @@ public struct SelectionRetrievalCoordinator: Sendable {
         guard evidence.strength == .weak,
               evidence.reason == "ax-text-control" || evidence.reason == "beam-cursor+text-control"
         else { return evidence }
+        let phaseStart = trace.elapsedMicros
+        defer { trace.addMetric("evidenceSettleMicros", trace.elapsedMicros - phaseStart) }
         let maxRetries = max(0, configuration.evidenceSettleMaxRetries)
         for _ in 0..<maxRetries {
+            trace.addMetric("evidenceRetries")
             if Task.isCancelled { return evidence }
             try? await Task.sleep(nanoseconds: UInt64(configuration.evidenceSettleInterval * 1_000_000_000))
             guard let fresh = await inspectWithWatchdog(trace: trace) else { return evidence }
@@ -1067,7 +1115,7 @@ public struct SelectionRetrievalCoordinator: Sendable {
                 isFallbackFromAX: isFallbackFromAX
             ), candidate.strength > evidence.strength
             else { continue }
-            trace.log(.debug, .gate, "copy evidence settled", fields: [
+            trace.log(.trace, .gate, "copy evidence settled", fields: [
                 "from": .token(evidence.reason),
                 "to": .token(candidate.reason)
             ])

@@ -27,6 +27,7 @@ public struct SelectionReplacer {
     public typealias DirectAXReplacer = @MainActor @Sendable (AXUIElement, String) -> Bool
     public typealias KeyPoster = @MainActor @Sendable (CGKeyCode, CGEventFlags) -> Void
     public typealias AppActivator = @MainActor @Sendable (NSRunningApplication) -> Void
+    public typealias TargetActiveChecker = @MainActor @Sendable (NSRunningApplication) async -> Bool
 
     public let configuration: SelectionConfiguration
     public let pasteboard: NSPasteboard
@@ -34,6 +35,7 @@ public struct SelectionReplacer {
     public let directAXReplacer: DirectAXReplacer
     public let keyPoster: KeyPoster
     public let appActivator: AppActivator
+    public let targetActiveChecker: TargetActiveChecker
 
     public init(
         configuration: SelectionConfiguration = .default,
@@ -41,7 +43,8 @@ public struct SelectionReplacer {
         focusedElementProvider: @escaping FocusedElementProvider = SelectionReplacer.defaultFocusedElement,
         directAXReplacer: @escaping DirectAXReplacer = SelectionReplacer.defaultDirectAXReplacer,
         keyPoster: @escaping KeyPoster = { KeyboardEventPoster.postKey(keyCode: $0, flags: $1) },
-        appActivator: @escaping AppActivator = { $0.activate() }
+        appActivator: @escaping AppActivator = { $0.activate() },
+        targetActiveChecker: @escaping TargetActiveChecker = SelectionReplacer.defaultTargetActiveChecker
     ) {
         self.configuration = configuration
         self.pasteboard = pasteboard
@@ -49,6 +52,7 @@ public struct SelectionReplacer {
         self.directAXReplacer = directAXReplacer
         self.keyPoster = keyPoster
         self.appActivator = appActivator
+        self.targetActiveChecker = targetActiveChecker
     }
 
     public static let `default` = SelectionReplacer()
@@ -70,6 +74,17 @@ public struct SelectionReplacer {
             }
         }
         return false
+    }
+
+    public static let defaultTargetActiveChecker: TargetActiveChecker = { targetApp in
+        let deadline = Date().addingTimeInterval(0.3)
+        while Date() < deadline, !Task.isCancelled, !targetApp.isTerminated {
+            if NSWorkspace.shared.frontmostApplication?.processIdentifier == targetApp.processIdentifier {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return NSWorkspace.shared.frontmostApplication?.processIdentifier == targetApp.processIdentifier
     }
 
     /// Replaces the current selection in the target app with the given text.
@@ -101,8 +116,21 @@ public struct SelectionReplacer {
             }
         }
 
-        // 2. Fall back to non-destructive pasteboard delivery:
-        let snapshot = restorePasteboard ? PasteboardSnapshot.capture(pasteboard) : nil
+        // Reserve the clipboard before activation can suspend. Another operation cannot
+        // replace the payload during preparation or the committed delivery window.
+        let session = try await PasteboardCoordinator.shared.acquireSession(priority: .userAction, pasteboard: pasteboard)
+        if let targetApp {
+            appActivator(targetApp)
+            let active = await targetActiveChecker(targetApp)
+            guard active, !Task.isCancelled else {
+                session.restoreImmediately()
+                throw OpenSelectionError.targetApplicationUnavailable
+            }
+        }
+        do { try Task.checkCancellation() } catch {
+            session.restoreImmediately()
+            throw error
+        }
 
         pasteboard.clearContents()
         if !flavors.isEmpty {
@@ -128,30 +156,32 @@ public struct SelectionReplacer {
             pasteboard.writeObjects([item])
         }
         let changeCountAfterWrite = pasteboard.changeCount
-
-        if let targetApp {
-            appActivator(targetApp)
-        }
+        PasteboardCoordinator.shared.recordOwnedWrite(changeCount: changeCountAfterWrite, for: session)
 
         // Synthesize paste keystroke:
         // When matchStyle is requested, use Option+Shift+Command+V (Paste and Match Style)
         let keyFlags: CGEventFlags = matchStyle ? [.maskCommand, .maskAlternate, .maskShift] : .maskCommand
         keyPoster(configuration.pasteVirtualKey, keyFlags)
 
-        if restorePasteboard {
-            // Document apps (like Apple Notes) sync asynchronously and benefit from a slightly longer delivery window
-            let baseDelay = configuration.pasteboardDeliveryRestoreDelay
-            let restoreDelay = isRichDocApp ? max(baseDelay, Self.richDocumentRestoreDelay) : baseDelay
-            if restoreDelay > 0 {
-                try? await Task.sleep(nanoseconds: UInt64(restoreDelay * 1_000_000_000))
-                if pasteboard.changeCount == changeCountAfterWrite {
-                    snapshot?.restore(to: pasteboard, transientMarkers: true)
-                    DiagnosticsHub.shared.log(.debug, .pasteboard, "selection replacer restored original pasteboard contents")
-                } else {
-                    DiagnosticsHub.shared.log(.debug, .pasteboard, "selection replacer pasteboard mutated during delivery, skipping restore")
-                }
+        // Document apps (like Apple Notes) sync asynchronously and benefit from a slightly longer delivery window
+        let baseDelay = configuration.pasteboardDeliveryRestoreDelay
+        let effectiveDelay = isRichDocApp ? max(baseDelay, Self.richDocumentRestoreDelay) : baseDelay
+
+        // An already-posted paste is external work: cancellation cannot shorten the
+        // delivery window. This unstructured task owns its independent bounded lifetime.
+        let deliveryTask = Task { @MainActor in
+            if effectiveDelay > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(effectiveDelay * 1_000_000_000))
             }
         }
+        PasteboardCoordinator.shared.markDelivering(for: session)
+        _ = await deliveryTask.result
+        if restorePasteboard {
+            session.restoreImmediately(expectedChangeCount: changeCountAfterWrite)
+        } else {
+            session.commitPermanent()
+        }
+
     }
 
     /// Replaces the selection (convenience alias for replace).

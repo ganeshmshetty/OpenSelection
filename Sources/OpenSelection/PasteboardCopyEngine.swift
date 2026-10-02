@@ -15,34 +15,54 @@ public struct PasteboardCopyEngine {
     /// window. Defaults to the system overlay gate (see `CopyTriggerGate`).
     public typealias CopyAuthorization = @MainActor () -> Bool
 
+    /// Test seam for physical copy observation; production also watches untagged key events.
+    internal var userCopyObserved: @MainActor () -> Bool = { false }
+
     private let configuration: SelectionConfiguration
     private let isCopyAuthorized: CopyAuthorization
+    private let authorizationFailure: (@MainActor @Sendable () -> SelectionReadStatus?)?
 
     public init(
         configuration: SelectionConfiguration = .default,
+        authorizationFailure: (@MainActor @Sendable () -> SelectionReadStatus?)? = nil,
         isCopyAuthorized: @escaping CopyAuthorization = {
             !CopyTriggerGate.isForeignOverlayPresent(at: NSEvent.mouseLocation)
         }
     ) {
+        self.authorizationFailure = authorizationFailure
         self.configuration = configuration
         self.isCopyAuthorized = isCopyAuthorized
     }
 
     /// Runs `trigger` between archiving the pasteboard and polling for a change.
-    public func capture(
+    @MainActor
+    /// Compatibility projection for callers that only need text.
+    public func capture(pasteboard: NSPasteboard = .general, timeout: TimeInterval? = nil,
+                        restoreDelay: TimeInterval? = nil, trigger: CopyTrigger) async -> SelectionResult? {
+        await captureResponse(pasteboard: pasteboard, timeout: timeout, restoreDelay: restoreDelay, trigger: trigger).result
+    }
+
+    public func captureResponse(
         pasteboard: NSPasteboard = .general,
         timeout: TimeInterval? = nil,
         restoreDelay: TimeInterval? = nil,
         trigger: CopyTrigger
-    ) async -> SelectionResult? {
+    ) async -> SelectionReadResponse {
+        let trace = SelectionTrace.current
+        let phaseStart = trace?.elapsedMicros ?? 0
+        defer { if let trace { trace.addMetric("copyCaptureMicros", trace.elapsedMicros - phaseStart) } }
         // Refuse before posting anything: a key window owned by another app means the synthetic ⌘C
         // would fire that overlay's shortcut and tear it down instead of reaching the target app.
+        if Task.isCancelled { return SelectionReadResponse(status: .cancelled) }
         guard isCopyAuthorized() else {
-            DiagnosticsHub.shared.log(.debug, .pasteboard, "copy engine suppressed, foreign overlay owns key window")
-            return nil
+            DiagnosticsHub.shared.log(.trace, .pasteboard, "copy engine suppressed, foreign overlay owns key window")
+            return SelectionReadResponse(status: authorizationFailure?() ?? .copyBlocked)
         }
 
-        let snapshot = PasteboardSnapshot.capture(pasteboard)
+        guard let session = PasteboardCoordinator.shared.beginSession(priority: .backgroundCapture, pasteboard: pasteboard) else {
+            DiagnosticsHub.shared.log(.trace, .pasteboard, "copy engine suppressed, active higher-priority pasteboard session")
+            return SelectionReadResponse(status: .busy)
+        }
         let initialChangeCount = pasteboard.changeCount
 
         // Watch for the user's own ⌘C/⌘X while the synthetic copy is in flight. Our posted events
@@ -59,6 +79,13 @@ public struct PasteboardCopyEngine {
         }
         defer { if let keyMonitor { NSEvent.removeMonitor(keyMonitor) } }
 
+        guard !session.isCancelled else { return SelectionReadResponse(status: .cancelled) }
+
+        defer {
+            PasteboardCoordinator.shared.markCaptureFinished(for: session)
+        }
+        trace?.recordClipboardRestored(false)
+        PasteboardCoordinator.shared.markCopyPosted(for: session)
         trigger()
 
         let resolvedTimeout = timeout ?? Self.pollingTimeout(for: NSWorkspace.shared.frontmostApplication?.bundleIdentifier, configuration: configuration)
@@ -71,25 +98,28 @@ public struct PasteboardCopyEngine {
         // holds OUR synthetic copy, so the snapshot must be restored or their clipboard is lost).
         var postCopyCount: Int?
 
-        while Date() < deadline && !Task.isCancelled {
+        // Drain an already-posted copy even if its caller cancels; queued writes must
+        // not overtake the target app's bounded copy-response window.
+        while Date() < deadline && !session.isCancelled {
             // The user pressed ⌘C/⌘X while our copy was in flight. Bail either way, but only restore
             // when the pasteboard provably still holds our own copy: an untagged keydown does not
             // guarantee a clipboard write (no selection, or an app that ignores the shortcut), and
             // skipping the restore in that case would replace the user's clipboard with our
             // synthetic selection.
-            if userCopied.withLock({ $0 }) {
-                Self.restoreAfterUserCopyIfNeeded(
-                    changeCount: pasteboard.changeCount,
-                    postCopyCount: postCopyCount,
-                    snapshot: snapshot,
-                    pasteboard: pasteboard
-                )
-                return nil
+            if (userCopied.withLock({ $0 }) || userCopyObserved()) {
+                if Self.shouldRestoreAfterUserCopy(changeCount: pasteboard.changeCount, postCopyCount: postCopyCount) {
+                    session.restoreImmediately()
+                    trace?.recordClipboardRestored(session.didRestore)
+                } else {
+                    session.commitPermanent()
+                }
+                return SelectionReadResponse(status: .copyBlocked)
             }
 
             if pasteboard.changeCount != initialChangeCount {
                 if let candidate = pasteboard.string(forType: .string),
                    Self.hasSelection(candidate) {
+                    PasteboardCoordinator.shared.markDirty(for: session)
                     // Extract raw pasteboard data synchronously and restore the original items IMMEDIATELY.
                     // This shrinks the clipboard exposure window down to sub-millisecond microseconds,
                     // preventing third-party clipboard managers (Maccy, Paste, etc.) from intercepting
@@ -114,11 +144,16 @@ public struct PasteboardCopyEngine {
                     // and bailing out would leave it there in place of the user's clipboard. A user copy
                     // that really landed advanced the changeCount and takes the bail-out instead.
                     guard pasteboard.changeCount == observedCopyCount else {
-                        DiagnosticsHub.shared.log(.debug, .pasteboard, "copy engine external copy detected, leaving clipboard untouched")
-                        return nil
+                        DiagnosticsHub.shared.log(.trace, .pasteboard, "copy engine external copy detected, leaving clipboard untouched")
+                        session.commitPermanent()
+                        return SelectionReadResponse(status: .copyBlocked)
                     }
 
-                    snapshot.restore(to: pasteboard, transientMarkers: true)
+                    PasteboardCoordinator.shared.recordOwnedWrite(changeCount: observedCopyCount, for: session)
+                    session.restoreImmediately(expectedChangeCount: observedCopyCount)
+                    trace?.recordClipboardRestored(session.didRestore)
+                    if Task.isCancelled { return SelectionReadResponse(status: .cancelled) }
+                    guard isCopyAuthorized() else { return SelectionReadResponse(status: authorizationFailure?() ?? .copyBlocked) }
 
                     // Post-process HTML/RTF in memory now that the pasteboard is safely restored
                     let html = rawHTML ?? rawRTFData.flatMap(Self.htmlFromRTFData)
@@ -138,21 +173,31 @@ public struct PasteboardCopyEngine {
                     break
                 }
             }
-            try? await Task.sleep(nanoseconds: UInt64(pollInterval * 1_000_000_000))
+            let poll = Task { try? await Task.sleep(nanoseconds: UInt64(pollInterval * 1_000_000_000)) }
+            _ = await poll.value
         }
 
         guard let result else {
             let changeCount = pasteboard.changeCount
-            let userCopyLanded = userCopied.withLock({ $0 })
+            let userCopyLanded = (userCopied.withLock({ $0 }) || userCopyObserved())
                 && !Self.shouldRestoreAfterUserCopy(changeCount: changeCount, postCopyCount: postCopyCount)
-            if changeCount != initialChangeCount, !userCopyLanded {
-                DiagnosticsHub.shared.log(.debug, .pasteboard, "copy engine found no text within deadline, restoring snapshot")
-                snapshot.restore(to: pasteboard, transientMarkers: true)
+            if !session.isCancelled {
+                if changeCount != initialChangeCount, !userCopyLanded {
+                    DiagnosticsHub.shared.log(.trace, .pasteboard, "copy engine found no text within deadline, restoring snapshot")
+                    PasteboardCoordinator.shared.recordOwnedWrite(changeCount: changeCount, for: session)
+                    session.restoreImmediately(expectedChangeCount: changeCount)
+                    trace?.recordClipboardRestored(session.didRestore)
+                } else {
+                    session.commitPermanent()
+                }
             }
-            return nil
+            let status: SelectionReadStatus = Task.isCancelled ? .cancelled
+                : session.isCancelled ? .copyBlocked
+                : authorizationFailure?() ?? (userCopyLanded ? .copyBlocked : (changeCount == initialChangeCount ? .timedOut : .noSelection))
+            return SelectionReadResponse(status: status)
         }
 
-        return result
+        return SelectionReadResponse(result: result, status: .selection)
     }
 
     /// Whether the snapshot must be restored after a user ⌘C/⌘X was observed mid-grab.
@@ -179,11 +224,11 @@ public struct PasteboardCopyEngine {
         pasteboard: NSPasteboard
     ) -> Bool {
         guard shouldRestoreAfterUserCopy(changeCount: changeCount, postCopyCount: postCopyCount) else {
-            DiagnosticsHub.shared.log(.debug, .pasteboard, "copy engine user copied during grab, leaving clipboard untouched")
+            DiagnosticsHub.shared.log(.trace, .pasteboard, "copy engine user copied during grab, leaving clipboard untouched")
             return false
         }
         snapshot.restore(to: pasteboard, transientMarkers: true)
-        DiagnosticsHub.shared.log(.debug, .pasteboard, "copy engine user copy wrote nothing, restored snapshot over stale copy")
+        DiagnosticsHub.shared.log(.trace, .pasteboard, "copy engine user copy wrote nothing, restored snapshot over stale copy")
         return true
     }
 

@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import os
 
 public enum CopyMenuState: Sendable, Equatable {
     case enabled, disabled
@@ -9,16 +10,6 @@ public enum CopyMenuState: Sendable, Equatable {
 
 private struct AXBox: @unchecked Sendable { let element: AXUIElement }
 
-private final class OneShot<T: Sendable>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var continuation: CheckedContinuation<T, Never>?
-    init(_ c: CheckedContinuation<T, Never>) { continuation = c }
-    func resume(_ value: T) {
-        lock.lock(); let c = continuation; continuation = nil; lock.unlock()
-        c?.resume(returning: value)
-    }
-}
-
 /// Per-PID probe: coalesces concurrent callers, caches the Copy element, and never conflates
 /// "couldn't tell" with "disabled".
 @MainActor
@@ -27,7 +18,8 @@ final class CopyMenuProbe {
     private var cached: [pid_t: AXBox] = [:]
     private var inFlight: [pid_t: Task<CopyMenuState, Never>] = [:]
     private let queue = DispatchQueue(label: "com.openselection.copy-menu-probe",
-                                      qos: .userInitiated)
+                                      qos: .userInitiated,
+                                      attributes: .concurrent)
     nonisolated(unsafe) private var terminationObserver: (any NSObjectProtocol)?
 
     init() {
@@ -107,30 +99,55 @@ final class CopyMenuProbe {
         }
     }
 
-    private func run<T: Sendable>(hardLimit: TimeInterval, fallback: T,
-                                  _ work: @escaping @Sendable () -> T) async -> T {
-        await withCheckedContinuation { c in
-            let gate = OneShot(c)
-            queue.async { gate.resume(work()) }
-            queue.asyncAfter(deadline: .now() + hardLimit) { gate.resume(fallback) }
+    private actor ConcurrencyGate {
+        private var inFlight = 0
+        func tryAcquire(limit: Int) -> Bool {
+            guard inFlight < limit else { return false }
+            inFlight += 1
+            return true
+        }
+        func release() { inFlight -= 1 }
+    }
+    private let gate = ConcurrencyGate()
+    var maxConcurrent: Int = 4
+
+    func run<T: Sendable>(hardLimit: TimeInterval, fallback: T,
+                          _ work: @escaping @Sendable () -> T) async -> T {
+        guard await gate.tryAcquire(limit: maxConcurrent) else {
+            return fallback
+        }
+        return await withCheckedContinuation { c in
+            let resume = OnceResume<T>()
+            let watchdog = TaskBox()
+            watchdog.set(Task {
+                try? await Task.sleep(nanoseconds: UInt64(hardLimit * 1_000_000_000))
+                resume.resume(c, with: fallback)
+            })
+            queue.async {
+                let result = work()
+                Task {
+                    await self.gate.release()
+                    if resume.resume(c, with: result) { watchdog.cancel() }
+                }
+            }
         }
     }
 }
 
 @MainActor
 public enum AutomaticCopyCapture {
-    public static func capture(
-        configuration: SelectionConfiguration = .default,
-        request: CopyRequest
-    ) async -> SelectionResult? {
-        await capture(
-            configuration: configuration,
-            request: request,
-            pasteboard: .general,
+    public static func capture(configuration: SelectionConfiguration = .default,
+                               request: CopyRequest) async -> SelectionResult? {
+        await captureResponse(configuration: configuration, request: request).result
+    }
+
+    public static func captureResponse(configuration: SelectionConfiguration = .default,
+                                       request: CopyRequest) async -> SelectionReadResponse {
+        await captureResponse(
+            configuration: configuration, request: request, pasteboard: .general,
             frontmostPID: { NSWorkspace.shared.frontmostApplication?.processIdentifier },
             menuState: { await CopyMenuProbe.shared.settledState(for: $0, timeout: min(0.15, configuration.axReadTimeout)) },
-            overlayPresent: { CopyTriggerGate.isForeignOverlayPresent(at: NSEvent.mouseLocation) }
-        )
+            overlayPresent: { CopyTriggerGate.isForeignOverlayPresent(at: NSEvent.mouseLocation) })
     }
 
     /// Convenience overload if called with just a trigger (e.g. legacy/explicit callers)
@@ -156,28 +173,41 @@ public enum AutomaticCopyCapture {
     }
 
     static func capture(
+        configuration: SelectionConfiguration = .default, request: CopyRequest,
+        pasteboard: NSPasteboard, frontmostPID: @escaping @MainActor () -> pid_t?,
+        menuState: @MainActor (pid_t) async -> CopyMenuState,
+        overlayPresent: @escaping @MainActor () -> Bool
+    ) async -> SelectionResult? {
+        await captureResponse(configuration: configuration, request: request, pasteboard: pasteboard,
+            frontmostPID: frontmostPID, menuState: menuState, overlayPresent: overlayPresent).result
+    }
+
+    static func captureResponse(
         configuration: SelectionConfiguration = .default,
         request: CopyRequest,
         pasteboard: NSPasteboard,
         frontmostPID: @escaping @MainActor () -> pid_t?,
         menuState: @MainActor (pid_t) async -> CopyMenuState,
         overlayPresent: @escaping @MainActor () -> Bool
-    ) async -> SelectionResult? {
-        guard !Task.isCancelled, let pid = frontmostPID() else { return nil }
+    ) async -> SelectionReadResponse {
+        if Task.isCancelled { return SelectionReadResponse(status: .cancelled) }
+        guard let pid = frontmostPID() else { return SelectionReadResponse(status: .targetChanged) }
 
         if request.evidence.strength == .weak {
+            let phaseStart = SelectionTrace.current?.elapsedMicros ?? 0
             let state = await menuState(pid)
-            DiagnosticsHub.shared.log(.debug, .pasteboard, "automatic copy evaluating menu", fields: [
+            if let trace = SelectionTrace.current { trace.addMetric("copyMenuMicros", trace.elapsedMicros - phaseStart) }
+            DiagnosticsHub.shared.log(.trace, .pasteboard, "automatic copy evaluating menu", fields: [
                 "pid": .int(Int64(pid)),
                 "menuState": .token("\(state)"),
                 "evidence": .token(request.evidence.reason)
             ])
             guard state != .disabled else {
-                DiagnosticsHub.shared.log(.debug, .pasteboard, "automatic copy skipped, copy disabled under weak evidence", fields: [
+                DiagnosticsHub.shared.log(.trace, .pasteboard, "automatic copy skipped, copy disabled under weak evidence", fields: [
                     "pid": .int(Int64(pid)),
                     "menuState": .token("\(state)")
                 ])
-                return nil
+                return SelectionReadResponse(status: .copyBlocked)
             }
             if case .unknown(let reason) = state {
                 // "Couldn't tell" is not "disabled" (the CopyMenuProbe contract itself never
@@ -187,23 +217,28 @@ public enum AutomaticCopyCapture {
                 // retrieval failure. The pasteboard engine snapshots and restores around the
                 // trigger, so proceeding on an unknown verdict cannot clobber the clipboard —
                 // only a positive `.disabled` refuses.
-                DiagnosticsHub.shared.log(.debug, .pasteboard, "copy menu state unknown, proceeding under weak evidence", fields: [
+                DiagnosticsHub.shared.log(.trace, .pasteboard, "copy menu state unknown, proceeding under weak evidence", fields: [
                     "pid": .int(Int64(pid)),
                     "reason": .token(reason.rawValue)
                 ])
             }
         } else {
-            DiagnosticsHub.shared.log(.debug, .pasteboard, "automatic copy proceeding with strong evidence", fields: [
+            DiagnosticsHub.shared.log(.trace, .pasteboard, "automatic copy proceeding with strong evidence", fields: [
                 "pid": .int(Int64(pid)),
                 "evidence": .token(request.evidence.reason)
             ])
         }
-        guard !Task.isCancelled, frontmostPID() == pid else { return nil }
+        if Task.isCancelled { return SelectionReadResponse(status: .cancelled) }
+        guard frontmostPID() == pid else { return SelectionReadResponse(status: .targetChanged) }
 
-        let engine = PasteboardCopyEngine(configuration: configuration, isCopyAuthorized: {
+        let engine = PasteboardCopyEngine(configuration: configuration, authorizationFailure: {
+            if Task.isCancelled { return .cancelled }
+            if frontmostPID() != pid { return .targetChanged }
+            return overlayPresent() ? .copyBlocked : nil
+        }, isCopyAuthorized: {
             !Task.isCancelled && frontmostPID() == pid && !overlayPresent()
         })
-        return await engine.capture(pasteboard: pasteboard) {
+        return await engine.captureResponse(pasteboard: pasteboard) {
             guard !Task.isCancelled, frontmostPID() == pid else { return }
             request.trigger()
         }

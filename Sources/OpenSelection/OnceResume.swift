@@ -11,13 +11,15 @@ final class OnceResume<T: Sendable>: @unchecked Sendable {
     private let lock = OSAllocatedUnfairLock(initialState: false)
 
     @discardableResult
-    func resume(_ continuation: CheckedContinuation<T, Never>, with value: T) -> Bool {
+    func resume(_ continuation: CheckedContinuation<T, Never>, with value: T,
+                beforeResume: @Sendable () -> Void = {}) -> Bool {
         let shouldResume = lock.withLock { resumed -> Bool in
             guard !resumed else { return false }
             resumed = true
             return true
         }
         if shouldResume {
+            beforeResume()
             continuation.resume(returning: value)
         }
         return shouldResume

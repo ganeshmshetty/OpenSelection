@@ -222,4 +222,37 @@ final class AutomaticCopyCaptureTests: XCTestCase {
         XCTAssertNil(result)
         XCTAssertEqual(board.changeCount, changeCount)
     }
+
+    func testCopyMenuProbeEnforcesDeadlineWhenWorkerBlocks() async {
+        let probe = CopyMenuProbe()
+        let start = Date()
+        let result = await probe.run(hardLimit: 0.05, fallback: "fallback") {
+            Thread.sleep(forTimeInterval: 0.5)
+            return "finished"
+        }
+        let elapsed = Date().timeIntervalSince(start)
+        XCTAssertEqual(result, "fallback")
+        XCTAssertLessThan(elapsed, 0.25, "watchdog must enforce deadline even if worker blocks queue")
+    }
+    func testCopyMenuWorkerRetainsPermitAfterDeadline() async {
+        let probe = CopyMenuProbe()
+        probe.maxConcurrent = 1
+        let unblock = DispatchSemaphore(value: 0)
+        defer { unblock.signal() }
+        let first = await probe.run(hardLimit: 0.03, fallback: false) {
+            unblock.wait()
+            return true
+        }
+        XCTAssertFalse(first)
+        let capped = await probe.run(hardLimit: 0.03, fallback: false) {
+            XCTFail("A timed-out worker must retain its permit")
+            return true
+        }
+        XCTAssertFalse(capped)
+        unblock.signal()
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        let recovered = await probe.run(hardLimit: 0.1, fallback: false) { true }
+        XCTAssertTrue(recovered)
+    }
+
 }
