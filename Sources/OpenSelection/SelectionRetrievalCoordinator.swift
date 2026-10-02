@@ -877,7 +877,6 @@ public struct SelectionRetrievalCoordinator: Sendable {
             timeout.set(Task {
                 try? await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
                 if resume.resume(continuation, with: nil) {
-                    Task.detached { await Self.inspectGate.release() }
                     trace?.log(.warning, .ax, "ax inspect deadline exceeded", fields: [
                         "timeoutMicros": .micros(UInt32(timeoutSeconds * 1_000_000))
                     ])
@@ -885,10 +884,10 @@ public struct SelectionRetrievalCoordinator: Sendable {
             })
 
             Self.axInspectQueue.async {
+                defer { Task.detached { await Self.inspectGate.release() } }
                 let target = inspect(trace)
                 if resume.resume(continuation, with: target) {
                     timeout.cancel()
-                    Task.detached { await Self.inspectGate.release() }
                 }
             }
         }
