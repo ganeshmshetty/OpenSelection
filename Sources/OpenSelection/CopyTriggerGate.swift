@@ -63,6 +63,7 @@ public enum CopyTriggerGate {
         "pl.maketheweb.cleanshotx",
         "cc.ffitch.shottr",
         "com.macshot.app",
+        "com.Snipaste",
         "com.TechSmith.Snagit",
         "net.telestream.screenflow",
         "com.wulkano.kap",
