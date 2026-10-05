@@ -49,6 +49,44 @@ public final class SelectionTrace: Sendable {
     public let parent: TraceID?
     public let trigger: TriggerSource
     private let startInstant: ContinuousClock.Instant
+    /// Wall-clock instant after which blocking AX work for the current inspect attempt must
+    /// stop issuing new queries. Refreshed to a fresh watchdog-sized budget by every
+    /// `inspectWithWatchdog` attempt (initial read and each settle retry), so each worker is
+    /// bounded individually: a stalled target app cannot park a worker — and its
+    /// concurrency-gate permit — far past the deadline, while lagging-but-responsive apps
+    /// keep a full budget on every attempt. `nil` means unbounded (traces that never drive
+    /// live AX keep legacy behavior).
+    ///
+    /// Remaining time is always derived from the monotonic `instant`, never the wall clock:
+    /// the watchdog sleeps on a monotonic basis too, so an NTP step or sleep/wake cycle
+    /// cannot inflate a worker's budget past its watchdog.
+    private let deadlineState = OSAllocatedUnfairLock<(wall: Date?, instant: ContinuousClock.Instant?)>(initialState: (nil, nil))
+    public var deadline: Date? {
+        deadlineState.withLock { $0.wall }
+    }
+
+    /// Monotonic seconds left in the current AX budget, clamped at zero, or `nil` when no
+    /// deadline constrains this trace.
+    public var remainingAXBudget: TimeInterval? {
+        deadlineState.withLock { state in
+            guard let instant = state.instant else { return nil }
+            let remaining = instant - ContinuousClock.now
+            return max(0, Double(remaining.components.seconds) + Double(remaining.components.attoseconds) / 1_000_000_000_000_000_000)
+        }
+    }
+
+    /// Starts a fresh watchdog-sized AX budget for the next inspect attempt on this trace.
+    public func refreshDeadline(_ date: Date) {
+        deadlineState.withLock { state in
+            state.wall = date
+            let interval = date.timeIntervalSinceNow
+            let wholeSeconds = Int64(floor(interval))
+            let attoseconds = Int64((interval - Double(wholeSeconds)) * 1_000_000_000_000_000_000)
+            state.instant = ContinuousClock.now.advanced(
+                by: Duration(secondsComponent: wholeSeconds, attosecondsComponent: attoseconds)
+            )
+        }
+    }
 
     public init(id: TraceID, parent: TraceID? = nil, trigger: TriggerSource = .programmatic) {
         self.id = id

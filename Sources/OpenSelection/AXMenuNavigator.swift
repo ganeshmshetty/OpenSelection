@@ -58,14 +58,15 @@ public struct AXMenuNavigator {
         timeout: TimeInterval = 0.5,
         deadline: Date? = nil
     ) -> AXUIElement? {
-        guard !isDeadlineExpired(deadline), let app else {
+        let budget = deadline.map(MenuDeadline.init(wall:))
+        guard budget?.isExpired != true, let app else {
             return nil
         }
 
         AXUIElementSetMessagingTimeout(app, Float(timeout))
 
-        guard let menuBar = queryElementAttribute(kAXMenuBarAttribute as CFString, of: app, timeout: timeout, deadline: deadline),
-              let topMenus: [AXUIElement] = queryAttribute(kAXChildrenAttribute as CFString, of: menuBar, timeout: timeout, deadline: deadline) else {
+        guard let menuBar = queryElementAttribute(kAXMenuBarAttribute as CFString, of: app, timeout: timeout, budget: budget),
+              let topMenus: [AXUIElement] = queryAttribute(kAXChildrenAttribute as CFString, of: menuBar, timeout: timeout, budget: budget) else {
             return nil
         }
 
@@ -78,20 +79,20 @@ public struct AXMenuNavigator {
                requireEnabled: requireEnabled,
                matchingShortcutOnly: matchingShortcutOnly,
                timeout: timeout,
-               deadline: deadline
+               budget: budget
            ) {
             return hit
         }
 
         for (index, menu) in topMenus.enumerated() where index != editMenuIndex {
-            guard !isDeadlineExpired(deadline) else { return nil }
+            guard budget?.isExpired != true else { return nil }
             if let hit = searchMenuSubtree(
                 command: command,
                 root: menu,
                 requireEnabled: requireEnabled,
                 matchingShortcutOnly: matchingShortcutOnly,
                 timeout: timeout,
-                deadline: deadline
+                budget: budget
             ) {
                 return hit
             }
@@ -144,10 +145,35 @@ public struct AXMenuNavigator {
 
     private static let maxTraversalDepth = 8
 
-    @inline(__always)
-    private static func isDeadlineExpired(_ deadline: Date?) -> Bool {
-        guard let deadline else { return false }
-        return Date() >= deadline
+    /// Monotonic traversal deadline, built once at each public entry point.
+    ///
+    /// Wall-clock `Date` deadlines drift under NTP steps and sleep/wake cycles: a backward
+    /// adjustment mid-walk would extend a stalled worker past its watchdog (and hold its
+    /// gate permit with it). Anchoring the remaining budget to a monotonic clock at entry —
+    /// like the inspect budget — closes that. The public API keeps accepting wall-clock
+    /// `Date`s; only the traversal internals run on the token.
+    private struct MenuDeadline: Sendable {
+        private let end: ContinuousClock.Instant
+
+        init(wall: Date) {
+            let interval = wall.timeIntervalSinceNow
+            let wholeSeconds = Int64(floor(interval))
+            let attoseconds = Int64((interval - Double(wholeSeconds)) * 1_000_000_000_000_000_000)
+            self.end = ContinuousClock.now.advanced(
+                by: Duration(secondsComponent: wholeSeconds, attosecondsComponent: attoseconds)
+            )
+        }
+
+        var isExpired: Bool { ContinuousClock.now >= end }
+
+        /// Per-call messaging timeout capped to the remaining budget, or `nil` when no
+        /// further IPC may be issued (expired deadline).
+        func timeout(capped timeout: TimeInterval) -> TimeInterval? {
+            let remaining = end - ContinuousClock.now
+            let seconds = Double(remaining.components.seconds) + Double(remaining.components.attoseconds) / 1_000_000_000_000_000_000
+            guard seconds > 0 else { return nil }
+            return min(timeout, max(0.02, seconds))
+        }
     }
 
     /// Recursively traverses a menu hierarchy down to `maxTraversalDepth`, checking elements against `command`.
@@ -158,19 +184,19 @@ public struct AXMenuNavigator {
         matchingShortcutOnly: Bool,
         currentDepth: Int = 0,
         timeout: TimeInterval,
-        deadline: Date?
+        budget: MenuDeadline?
     ) -> AXUIElement? {
-        guard !isDeadlineExpired(deadline), currentDepth <= maxTraversalDepth else {
+        guard budget?.isExpired != true, currentDepth <= maxTraversalDepth else {
             return nil
         }
 
-        if elementMatches(command: command, element: root, requireEnabled: requireEnabled, matchingShortcutOnly: matchingShortcutOnly, timeout: timeout, deadline: deadline) {
+        if elementMatches(command: command, element: root, requireEnabled: requireEnabled, matchingShortcutOnly: matchingShortcutOnly, timeout: timeout, budget: budget) {
             return root
         }
 
-        let childElements: [AXUIElement]? = queryAttribute(kAXChildrenAttribute as CFString, of: root, timeout: timeout, deadline: deadline)
+        let childElements: [AXUIElement]? = queryAttribute(kAXChildrenAttribute as CFString, of: root, timeout: timeout, budget: budget)
         for child in childElements ?? [] {
-            guard !isDeadlineExpired(deadline) else { return nil }
+            guard budget?.isExpired != true else { return nil }
             if let hit = searchMenuSubtree(
                 command: command,
                 root: child,
@@ -178,7 +204,7 @@ public struct AXMenuNavigator {
                 matchingShortcutOnly: matchingShortcutOnly,
                 currentDepth: currentDepth + 1,
                 timeout: timeout,
-                deadline: deadline
+                budget: budget
             ) {
                 return hit
             }
@@ -194,14 +220,14 @@ public struct AXMenuNavigator {
         requireEnabled: Bool,
         matchingShortcutOnly: Bool,
         timeout: TimeInterval,
-        deadline: Date?
+        budget: MenuDeadline?
     ) -> Bool {
-        guard !isDeadlineExpired(deadline) else { return false }
+        guard budget?.isExpired != true else { return false }
 
-        let title: String? = queryAttribute(kAXTitleAttribute as CFString, of: element, timeout: timeout, deadline: deadline)
-        let identifier: String? = queryAttribute(kAXIdentifierAttribute as CFString, of: element, timeout: timeout, deadline: deadline)
-        let cmdChar: String? = queryAttribute(kAXMenuItemCmdCharAttribute as CFString, of: element, timeout: timeout, deadline: deadline)
-        let rawModifiers: NSNumber? = queryAttribute(kAXMenuItemCmdModifiersAttribute as CFString, of: element, timeout: timeout, deadline: deadline)
+        let title: String? = queryAttribute(kAXTitleAttribute as CFString, of: element, timeout: timeout, budget: budget)
+        let identifier: String? = queryAttribute(kAXIdentifierAttribute as CFString, of: element, timeout: timeout, budget: budget)
+        let cmdChar: String? = queryAttribute(kAXMenuItemCmdCharAttribute as CFString, of: element, timeout: timeout, budget: budget)
+        let rawModifiers: NSNumber? = queryAttribute(kAXMenuItemCmdModifiersAttribute as CFString, of: element, timeout: timeout, budget: budget)
 
         guard matches(
             command,
@@ -215,7 +241,7 @@ public struct AXMenuNavigator {
         }
 
         if requireEnabled {
-            let isEnabled: Bool? = queryAttribute(kAXEnabledAttribute as CFString, of: element, timeout: timeout, deadline: deadline)
+            let isEnabled: Bool? = queryAttribute(kAXEnabledAttribute as CFString, of: element, timeout: timeout, budget: budget)
             guard isEnabled == true else { return false }
         }
 
@@ -229,9 +255,9 @@ public struct AXMenuNavigator {
         _ attribute: CFString,
         of element: AXUIElement,
         timeout: TimeInterval,
-        deadline: Date?
+        budget: MenuDeadline?
     ) -> T? {
-        queryRawAttribute(attribute, of: element, timeout: timeout, deadline: deadline) as? T
+        queryRawAttribute(attribute, of: element, timeout: timeout, budget: budget) as? T
     }
 
     /// Queries an accessibility attribute returning an `AXUIElement` if present and valid.
@@ -239,9 +265,9 @@ public struct AXMenuNavigator {
         _ attribute: CFString,
         of element: AXUIElement,
         timeout: TimeInterval,
-        deadline: Date?
+        budget: MenuDeadline?
     ) -> AXUIElement? {
-        guard let raw = queryRawAttribute(attribute, of: element, timeout: timeout, deadline: deadline),
+        guard let raw = queryRawAttribute(attribute, of: element, timeout: timeout, budget: budget),
               CFGetTypeID(raw) == AXUIElementGetTypeID() else {
             return nil
         }
@@ -249,14 +275,27 @@ public struct AXMenuNavigator {
     }
 
     /// Fetches an untyped CoreFoundation attribute value after verifying the aggregate deadline and setting the messaging timeout.
+    ///
+    /// When a budget is present the per-call messaging timeout is capped to the remaining
+    /// budget: a menu-tree walk over a stalled app must abort near the deadline instead of
+    /// blocking a full `timeout` on every one of its (potentially hundreds of) sequential
+    /// IPC calls and parking its worker — and its concurrency-gate permit — far past the
+    /// watchdog. On a responsive app the remaining budget always exceeds `timeout`, so this
+    /// is a no-op there. `nil` budget means uncapped legacy behavior.
     private static func queryRawAttribute(
         _ attribute: CFString,
         of element: AXUIElement,
         timeout: TimeInterval,
-        deadline: Date?
+        budget: MenuDeadline?
     ) -> CFTypeRef? {
-        guard !isDeadlineExpired(deadline) else { return nil }
-        AXUIElementSetMessagingTimeout(element, Float(timeout))
+        let effectiveTimeout: TimeInterval
+        if let budget {
+            guard let capped = budget.timeout(capped: timeout) else { return nil }
+            effectiveTimeout = capped
+        } else {
+            effectiveTimeout = timeout
+        }
+        AXUIElementSetMessagingTimeout(element, Float(effectiveTimeout))
         var valueRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, attribute, &valueRef) == .success else {
             return nil
@@ -277,10 +316,10 @@ public struct AXMenuNavigator {
     private static func snapshot(
         of element: AXUIElement,
         timeout: TimeInterval,
-        deadline: Date
+        budget: MenuDeadline
     ) -> (title: String?, id: String?, cmdChar: String?, mods: UInt?, enabled: Bool?)? {
-        guard !isDeadlineExpired(deadline) else { return nil }
-        AXUIElementSetMessagingTimeout(element, Float(timeout))
+        guard let effectiveTimeout = budget.timeout(capped: timeout) else { return nil }
+        AXUIElementSetMessagingTimeout(element, Float(effectiveTimeout))
         var out: CFArray?
         guard AXUIElementCopyMultipleAttributeValues(
             element,
@@ -316,20 +355,21 @@ public struct AXMenuNavigator {
         timeout: TimeInterval,
         deadline: Date
     ) -> MenuProbeOutcome {
+        let budget = MenuDeadline(wall: deadline)
         AXUIElementSetMessagingTimeout(app, Float(timeout))
-        guard let menuBar = queryElementAttribute(kAXMenuBarAttribute as CFString, of: app, timeout: timeout, deadline: deadline),
-              let top: [AXUIElement] = queryAttribute(kAXChildrenAttribute as CFString, of: menuBar, timeout: timeout, deadline: deadline)
-        else { return isDeadlineExpired(deadline) ? .timedOut : .noMenuBar }
+        guard let menuBar = queryElementAttribute(kAXMenuBarAttribute as CFString, of: app, timeout: timeout, budget: budget),
+              let top: [AXUIElement] = queryAttribute(kAXChildrenAttribute as CFString, of: menuBar, timeout: timeout, budget: budget)
+        else { return budget.isExpired ? .timedOut : .noMenuBar }
 
         let editIndex = 3
         let order = top.indices.filter { $0 == editIndex } + top.indices.filter { $0 != editIndex }
         for i in order {
-            if isDeadlineExpired(deadline) { return .timedOut }
-            if let hit = probeSubtree(command, top[i], matchingShortcutOnly, 0, timeout, deadline) {
+            if budget.isExpired { return .timedOut }
+            if let hit = probeSubtree(command, top[i], matchingShortcutOnly, 0, timeout, budget) {
                 return .found(hit.0, isEnabled: hit.1)
             }
         }
-        return isDeadlineExpired(deadline) ? .timedOut : .notFound
+        return budget.isExpired ? .timedOut : .notFound
     }
 
     private static func probeSubtree(
@@ -338,17 +378,17 @@ public struct AXMenuNavigator {
         _ shortcutOnly: Bool,
         _ depth: Int,
         _ timeout: TimeInterval,
-        _ deadline: Date
+        _ budget: MenuDeadline
     ) -> (AXUIElement, Bool?)? {
-        guard !isDeadlineExpired(deadline), depth <= maxTraversalDepth else { return nil }
-        if let s = snapshot(of: root, timeout: timeout, deadline: deadline),
+        guard !budget.isExpired, depth <= maxTraversalDepth else { return nil }
+        if let s = snapshot(of: root, timeout: timeout, budget: budget),
            matches(command, title: s.title, identifier: s.id, cmdChar: s.cmdChar,
                    cmdModifiers: s.mods, matchingShortcutOnly: shortcutOnly) {
             return (root, s.enabled)
         }
-        let kids: [AXUIElement]? = queryAttribute(kAXChildrenAttribute as CFString, of: root, timeout: timeout, deadline: deadline)
+        let kids: [AXUIElement]? = queryAttribute(kAXChildrenAttribute as CFString, of: root, timeout: timeout, budget: budget)
         for kid in kids ?? [] {
-            if let hit = probeSubtree(command, kid, shortcutOnly, depth + 1, timeout, deadline) { return hit }
+            if let hit = probeSubtree(command, kid, shortcutOnly, depth + 1, timeout, budget) { return hit }
         }
         return nil
     }

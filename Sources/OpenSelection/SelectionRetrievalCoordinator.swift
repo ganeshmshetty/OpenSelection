@@ -931,6 +931,16 @@ public struct SelectionRetrievalCoordinator: Sendable {
         }
         let inspect = self.inspect
         let timeoutSeconds = self.configuration.axReadTimeout
+        // Each attempt gets a fresh watchdog-sized AX budget on the shared trace: lagging but
+        // responsive apps keep full per-attempt behavior, while a stalled app's worker aborts
+        // near the deadline instead of parking (and holding its gate permit) far past it.
+        //
+        // Known overlap: a still-parked worker from an earlier attempt can observe a retry's
+        // refreshed deadline and keep querying past its own watchdog. Per-call caps bound
+        // that overrun to ~one extra budget, so the gate degrades transiently instead of
+        // wedging; per-worker deadlines would need a `TargetProvider` signature change, and
+        // sharing one trace keeps settle diagnostics correlated.
+        trace?.refreshDeadline(Date().addingTimeInterval(timeoutSeconds))
         return await withCheckedContinuation { (continuation: CheckedContinuation<AXElementInspector.Target?, Never>) in
             let resume = OnceResume<AXElementInspector.Target?>()
             let timeout = TaskBox()

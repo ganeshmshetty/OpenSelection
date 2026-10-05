@@ -93,13 +93,24 @@ public struct AXElementInspector {
     /// is the classic source of stale or missing selection reads.
     public static func inspect(ancestorDepth: Int = ancestorWalkDepth, trace: SelectionTrace? = nil) -> Target {
         trace?.log(.trace, .ax, "ax inspect started")
+        // Past the caller's watchdog: any result here is discarded, so skip the IPC storm
+        // entirely and free the worker (and its concurrency permit) immediately.
+        guard Self.isLive(trace: trace) else { return Target() }
         let systemWide = AXUIElementCreateSystemWide()
 
         // 1. Focused application — from the system-wide element.
+        //
+        // Explicit global-timeout policy: this query deliberately uses the unbounded `read`,
+        // never `boundedRead`. Per Apple's SDK, setting a messaging timeout on the system-wide
+        // element changes the process-global AX default, which unrelated AX clients and
+        // no-deadline diagnostic callers would then inherit without knowing. Every other query
+        // below runs against per-call element proxies, so capping those is side-effect free.
+        // Residual exposure is a single process-default-bounded call per inspect, after which
+        // the walk aborts near the deadline as usual.
         let focusedApp = read(systemWide, kAXFocusedApplicationAttribute, trace: trace).flatMap { axElement($0) }
 
         // 2. Focused UI element — from the focused application element, never system-wide.
-        let focusedElement = focusedApp.flatMap { axElement(read($0, kAXFocusedUIElementAttribute, trace: trace)) }
+        let focusedElement = focusedApp.flatMap { axElement(boundedRead($0, kAXFocusedUIElementAttribute, trace: trace)) }
 
         var role: String?
         var subRole: String?
@@ -108,8 +119,8 @@ public struct AXElementInspector {
         var webArea: AXUIElement?
 
         if let focusedElement {
-            role = read(focusedElement, kAXRoleAttribute) as? String
-            subRole = read(focusedElement, kAXSubroleAttribute) as? String
+            role = boundedRead(focusedElement, kAXRoleAttribute, trace: trace) as? String
+            subRole = boundedRead(focusedElement, kAXSubroleAttribute, trace: trace) as? String
 
             if role == webAreaRole {
                 webArea = focusedElement
@@ -118,13 +129,14 @@ public struct AXElementInspector {
             // Walk ancestors (bounded) for parent/container roles and web-area detection.
             var current = focusedElement
             for _ in 0..<ancestorDepth {
-                guard let parent = axElement(read(current, kAXParentAttribute)) else { break }
+                guard Self.isLive(trace: trace) else { break }
+                guard let parent = axElement(boundedRead(current, kAXParentAttribute, trace: trace)) else { break }
                 if CFEqual(parent, current) { break }
-                if let parentRole = read(parent, kAXRoleAttribute) as? String {
+                if let parentRole = boundedRead(parent, kAXRoleAttribute, trace: trace) as? String {
                     parentRoles.insert(parentRole)
                     containedInRoles.insert(parentRole)
                 }
-                if webArea == nil, read(parent, kAXRoleAttribute) as? String == webAreaRole {
+                if webArea == nil, boundedRead(parent, kAXRoleAttribute, trace: trace) as? String == webAreaRole {
                     webArea = parent
                 }
                 current = parent
@@ -134,31 +146,35 @@ public struct AXElementInspector {
         // Fallback: If focusedElement was not inside an AXWebArea (e.g. user selected static text on a page
         // so focus remained at the window or outer container level), search the focused window for the active AXWebArea.
         if shouldSearchWindowForWebArea(focusedRole: role, webArea: webArea), let app = focusedApp,
-           let window = read(app, kAXFocusedWindowAttribute).flatMap({ axElement($0) }) {
-            webArea = findFirstChild(role: webAreaRole, in: window, maxDepth: 6)
+           let window = boundedRead(app, kAXFocusedWindowAttribute, trace: trace).flatMap({ axElement($0) }) {
+            // The budget-aware read below short-circuits to nil past the deadline, which ends
+            // the depth-first search without further IPC instead of parking the worker.
+            webArea = findFirstChild(role: webAreaRole, in: window, maxDepth: 6, read: {
+                boundedRead($0, $1, trace: trace)
+            })
         }
 
         // Text/value attributes and selection bounds, where supported.
-        let selectedText = focusedElement.flatMap { read($0, kAXSelectedTextAttribute) as? String }
+        let selectedText = focusedElement.flatMap { boundedRead($0, kAXSelectedTextAttribute, trace: trace) as? String }
         // Resolve the selected marker range together with the element that owns it, so the
         // parameterized string query is never issued against a foreign element: Chromium reacts to
         // an `AXSelectedTextMarkerRange` asked of the wrong element, which can collapse the
         // page's selection. `AXStringForTextMarkerRange` is therefore always run on the same
         // element the range was read from.
         let marker: (owner: AXUIElement, range: AnyObject)?
-        if let focusedElement, let range = read(focusedElement, selectedTextMarkerRangeAttribute) {
+        if let focusedElement, let range = boundedRead(focusedElement, selectedTextMarkerRangeAttribute, trace: trace) {
             marker = (focusedElement, range)
-        } else if let webArea, let range = read(webArea, selectedTextMarkerRangeAttribute) {
+        } else if let webArea, let range = boundedRead(webArea, selectedTextMarkerRangeAttribute, trace: trace) {
             marker = (webArea, range)
         } else {
             marker = nil
         }
         let selectedTextMarkerRange = marker?.range
         let selectedTextMarkerRangeOwner = marker?.owner
-        let selectedMarkerText = marker.flatMap { markerText(for: $0.owner, markerRange: $0.range) }
-        let value = focusedElement.flatMap { read($0, kAXValueAttribute) as? String }
-        let selectedTextRange = focusedElement.flatMap { read($0, kAXSelectedTextRangeAttribute) }
-        let bounds = bounds(for: focusedElement, range: selectedTextRange)
+        let selectedMarkerText = marker.flatMap { markerText(for: $0.owner, markerRange: $0.range, trace: trace) }
+        let value = focusedElement.flatMap { boundedRead($0, kAXValueAttribute, trace: trace) as? String }
+        let selectedTextRange = focusedElement.flatMap { boundedRead($0, kAXSelectedTextRangeAttribute, trace: trace) }
+        let bounds = bounds(for: focusedElement, range: selectedTextRange, trace: trace)
 
         return Target(
             focusedApp: focusedApp,
@@ -204,8 +220,9 @@ public struct AXElementInspector {
     /// Returns `nil` unless `markerRange` really is an `AXTextMarkerRange` on `element` and the
     /// parameterized query succeeds. A marker range with no text resolves to `nil`/empty — the
     /// distinction that keeps a web canvas (Figma) from looking like a text selection.
-    public static func markerText(for element: AXUIElement?, markerRange: AnyObject?) -> String? {
+    public static func markerText(for element: AXUIElement?, markerRange: AnyObject?, trace: SelectionTrace? = nil) -> String? {
         guard let element, let markerRange, CFGetTypeID(markerRange) == AXTextMarkerRangeGetTypeID() else { return nil }
+        guard prepareParameterized(element, trace: trace) else { return nil }
         var value: CFTypeRef?
         guard AXUIElementCopyParameterizedAttributeValue(
             element, stringForTextMarkerRangeAttribute as CFString, markerRange as! AXTextMarkerRange, &value
@@ -263,6 +280,50 @@ public struct AXElementInspector {
         readResult(element, attribute, trace: trace).valueOrNil
     }
 
+    /// Minimum per-call AX messaging timeout: avoids zero-timeout failures when the deadline
+    /// is nearly exhausted while keeping any overrun negligible.
+    private static let minPerCallTimeout: TimeInterval = 0.02
+
+    /// Whether this inspect may still issue AX IPC. Past the trace deadline any result is
+    /// discarded by the caller's watchdog, so workers must stop instead of parking on IPC.
+    private static func isLive(trace: SelectionTrace?) -> Bool {
+        guard let remaining = remainingBudget(trace: trace) else { return true }
+        return remaining > 0
+    }
+
+    /// Remaining AX budget for this inspect (monotonic; see `remainingAXBudget`), or `nil`
+    /// when no trace deadline constrains it.
+    private static func remainingBudget(trace: SelectionTrace?) -> TimeInterval? {
+        trace?.remainingAXBudget
+    }
+
+    /// Deadline-aware single-attribute read for `inspect`.
+    ///
+    /// Without a trace deadline this is exactly `read` (legacy behavior, and the path every
+    /// diagnostic/test caller takes). With one, an expired deadline skips the IPC entirely,
+    /// and a live one caps the per-call messaging timeout to the remaining budget so a
+    /// stalled target app cannot park this worker — and its concurrency-gate permit — far
+    /// past the watchdog. Calls that could only finish after the caller's watchdog already
+    /// fired produce discarded results, so bounding them changes nothing the caller observes.
+    private static func boundedRead(_ element: AXUIElement, _ attribute: String, trace: SelectionTrace?) -> CFTypeRef? {
+        guard let remaining = remainingBudget(trace: trace) else {
+            return read(element, attribute, trace: trace)
+        }
+        guard remaining > 0 else { return nil }
+        AXUIElementSetMessagingTimeout(element, Float(max(minPerCallTimeout, remaining)))
+        return read(element, attribute, trace: trace)
+    }
+
+    /// Deadline gate for parameterized AX queries (`AXStringForTextMarkerRange`,
+    /// `AXBoundsForTextMarkerRange`). Sets the element's messaging timeout to the remaining
+    /// budget. Returns `false` when no query may be issued (expired deadline).
+    private static func prepareParameterized(_ element: AXUIElement, trace: SelectionTrace?) -> Bool {
+        guard remainingBudget(trace: trace) != nil else { return true }
+        guard let remaining = remainingBudget(trace: trace), remaining > 0 else { return false }
+        AXUIElementSetMessagingTimeout(element, Float(max(minPerCallTimeout, remaining)))
+        return true
+    }
+
     /// Returns the value as an `AXUIElement` only when it actually is one.
     private static func axElement(_ value: CFTypeRef?) -> AXUIElement? {
         guard let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
@@ -272,8 +333,9 @@ public struct AXElementInspector {
 
     /// The selection bounds for a text range via `kAXBoundsForRangeParameterizedAttribute`,
     /// or `nil` when the element or range does not support it.
-    private static func bounds(for element: AXUIElement?, range: CFTypeRef?) -> CGRect? {
+    private static func bounds(for element: AXUIElement?, range: CFTypeRef?, trace: SelectionTrace? = nil) -> CGRect? {
         guard let element, let range else { return nil }
+        guard prepareParameterized(element, trace: trace) else { return nil }
         var boundsRef: CFTypeRef?
         guard AXUIElementCopyParameterizedAttributeValue(
             element, kAXBoundsForRangeParameterizedAttribute as CFString, range, &boundsRef

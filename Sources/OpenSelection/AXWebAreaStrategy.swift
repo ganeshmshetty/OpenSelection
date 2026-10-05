@@ -13,6 +13,15 @@ public enum AXWebAreaStrategy {
     private static let stringForTextMarkerRangeAttribute = "AXStringForTextMarkerRange"
     private static let boundsForTextMarkerRangeAttribute = "AXBoundsForTextMarkerRange"
 
+    /// Messaging timeout for the fresh reads below, matching the default AX watchdog.
+    ///
+    /// The elements handed in can carry near-zero messaging timeouts left behind by a
+    /// deadline-capped inspect walk. Every query here must set its own timeout first:
+    /// inheriting the leftover would turn responsive apps into spurious misses. On a
+    /// responsive app this changes nothing (fast queries never approach it); on a stalled
+    /// app it fails fast instead of parking on the process-default timeout.
+    private static let freshReadTimeout: TimeInterval = 0.5
+
     /// kAXSelectedTextMarkerRange → AXStringForTextMarkerRange; bounds via
     /// AXBoundsForTextMarkerRange.
     public static func read(from target: AXElementInspector.Target) -> SelectionResult? {
@@ -63,6 +72,7 @@ public enum AXWebAreaStrategy {
     /// Re-queries `element` directly for fresh selection text and bounds, avoiding
     /// full system-wide ancestor tree re-inspections during settle-retry polling.
     public static func pollFresh(from element: AXUIElement) -> SelectionResult? {
+        AXUIElementSetMessagingTimeout(element, Float(freshReadTimeout))
         var markerValue: CFTypeRef?
         if AXUIElementCopyAttributeValue(element, selectedTextMarkerRangeAttribute as CFString, &markerValue) == .success,
            let markerRange = markerValue,
@@ -93,6 +103,7 @@ public enum AXWebAreaStrategy {
     }
 
     private static func string(for element: AXUIElement, markerRange: AXTextMarkerRange) -> String? {
+        AXUIElementSetMessagingTimeout(element, Float(freshReadTimeout))
         var value: CFTypeRef?
         guard AXUIElementCopyParameterizedAttributeValue(
             element, stringForTextMarkerRangeAttribute as CFString, markerRange, &value
@@ -101,6 +112,7 @@ public enum AXWebAreaStrategy {
     }
 
     private static func bounds(for element: AXUIElement, markerRange: AXTextMarkerRange) -> CGRect? {
+        AXUIElementSetMessagingTimeout(element, Float(freshReadTimeout))
         var value: CFTypeRef?
         guard AXUIElementCopyParameterizedAttributeValue(
             element, boundsForTextMarkerRangeAttribute as CFString, markerRange, &value
