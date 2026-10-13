@@ -202,14 +202,23 @@ public enum AutomaticCopyCapture {
                 "menuState": .token("\(state)"),
                 "evidence": .token(request.evidence.reason)
             ])
-            guard state != .disabled else {
+            if request.requiresEnabledCopyMenu {
+                guard state == .enabled else {
+                    DiagnosticsHub.shared.log(.trace, .pasteboard, "automatic copy skipped without enabled Copy command", fields: [
+                        "pid": .int(Int64(pid)),
+                        "menuState": .token("\(state)"),
+                        "evidence": .token(request.evidence.reason)
+                    ])
+                    return SelectionReadResponse(status: .copyBlocked)
+                }
+            } else if state == .disabled {
                 DiagnosticsHub.shared.log(.trace, .pasteboard, "automatic copy skipped, copy disabled under weak evidence", fields: [
                     "pid": .int(Int64(pid)),
                     "menuState": .token("\(state)")
                 ])
                 return SelectionReadResponse(status: .copyBlocked)
             }
-            if case .unknown(let reason) = state {
+            if !request.requiresEnabledCopyMenu, case .unknown(let reason) = state {
                 // "Couldn't tell" is not "disabled" (the CopyMenuProbe contract itself never
                 // conflates the two): a terminal omits the AppKit Edit ▸ Copy item entirely, so
                 // `noCopyItem` is its steady state, and a cold menu walk times out without

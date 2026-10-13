@@ -462,27 +462,64 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
         XCTAssertEqual(counter.calls, 3, "one initial inspect plus exactly evidenceSettleMaxRetries retries")
     }
 
-    /// OneNote's canvas exposes no AX text-selection evidence (no cursor class, no
-    /// `AXSelectedText`/range, no text-control role), so the copy-evidence gate would skip the only
-    /// strategy that can read it and retrieval would always return nil. The allowlist waives the
-    /// gate so the copy fallback runs. Regression: mouse selections in OneNote produced no popup.
-    func testCopyFallbackAppBypassesEvidenceGate() async {
+    func testNestedEditableCellCanSettleSelectionInsideCollection() async {
+        final class InspectCounter: @unchecked Sendable { var calls = 0 }
+        final class EvidenceBox: @unchecked Sendable { var evidence: CopyEvidence? }
+        let counter = InspectCounter()
+        let box = EvidenceBox()
+        let configuration = SelectionConfiguration(evidenceSettleInterval: 0.001, evidenceSettleMaxRetries: 1)
+        let coordinator = SelectionRetrievalCoordinator(
+            configuration: configuration,
+            inspect: { _ in
+                counter.calls += 1
+                return AXElementInspector.Target(
+                    role: "AXTextField",
+                    containedInRoles: ["AXTable", "AXCollection"],
+                    selectedText: counter.calls > 1 ? "cell text" : nil
+                )
+            },
+            copyCapture: { request in
+                box.evidence = request.evidence
+                return SelectionResult(text: "captured cell text")
+            }
+        )
+
+        let result = await coordinator.retrieve(
+            for: AppIdentity(bundleIdentifier: "com.example.table-editor"),
+            policy: AppPolicyContext(retrievalMode: .keyboardCopy),
+            cursor: .unknown
+        )
+
+        XCTAssertEqual(result?.text, "captured cell text")
+        XCTAssertEqual(counter.calls, 2, "nested editable control should be re-inspected for lagging selection")
+        XCTAssertEqual(box.evidence?.reason, "ax-selected-text")
+        XCTAssertEqual(box.evidence?.strength, .strong)
+    }
+
+    /// App identity never waives the evidence requirement. Opaque surfaces require an explicit
+    /// caller opt-out because AX cannot establish that their current selection is text.
+    func testCopyFallbackAppStillRequiresEvidence() async {
+        let tracker = CopyCallTracker()
         let coordinator = SelectionRetrievalCoordinator(
             inspect: { Self.opaqueTarget() },
-            copyCapture: { _ in SelectionResult(text: "onenote selection") }
+            copyCapture: { _ in
+                await tracker.recordCopy()
+                return SelectionResult(text: "should not be called")
+            }
         )
         let result = await coordinator.retrieve(
             for: AppIdentity(bundleIdentifier: "com.microsoft.onenote.mac"),
             policy: AppPolicyContext.default,
             cursor: .unknown
         )
-        XCTAssertEqual(result?.text, "onenote selection")
+        XCTAssertNil(result)
+        let invoked = await tracker.copyInvoked
+        XCTAssertFalse(invoked)
     }
 
     /// The evidence gate must still protect custom-drawn web canvases (e.g. Figma object drags)
-    /// from a spurious ⌘C. Figma is Electron, so its inspect target sits inside an AXWebArea —
-    /// that web-area surface is exactly what keeps the evidence requirement in force now that the
-    /// waiver is structural (no-text-surface) rather than a bundle-ID allowlist.
+    /// from a spurious ⌘C. Figma is Electron, so its inspect target sits inside an AXWebArea; the
+    /// absence of a text-selection signal keeps the copy strategy blocked.
     func testNonCopyFallbackAppStillRequiresEvidence() async {
         let tracker = CopyCallTracker()
         let coordinator = SelectionRetrievalCoordinator(
@@ -502,11 +539,8 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
         XCTAssertFalse(invoked, "the evidence gate must still block the copy for web-canvas apps")
     }
 
-    /// The structural waiver generalizes the OneNote allowlist: any app whose AX tree exposes no
-    /// text surface at all (no selected text/range, no text-control role, no containing AXWebArea)
-    /// gets one speculative copy attempt per gesture, because a synthetic copy is the only read
-    /// that can ever succeed there. No bundle-ID entry required.
-    func testOpaqueNativeAppWithoutTextSurfaceBypassesEvidenceGate() async {
+    /// Structural absence is not proof of a text selection, even for opaque native surfaces.
+    func testOpaqueNativeAppWithoutTextSurfaceRequiresExplicitOptOut() async {
         let coordinator = SelectionRetrievalCoordinator(
             inspect: { Self.opaqueTarget() },
             copyCapture: { _ in SelectionResult(text: "canvas selection") }
@@ -516,13 +550,19 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
             policy: AppPolicyContext.default,
             cursor: .unknown
         )
-        XCTAssertEqual(result?.text, "canvas selection")
+        XCTAssertNil(result)
+
+        let explicitResult = await coordinator.retrieve(
+            for: AppIdentity(bundleIdentifier: "com.example.someopaquecanvas"),
+            policy: AppPolicyContext.default,
+            cursor: .unknown,
+            requireCopyEvidence: false
+        )
+        XCTAssertEqual(explicitResult?.text, "canvas selection")
     }
 
-    /// The structural waiver must not extend to item-selection surfaces: a drag across a Photos grid
-    /// or Mail list selects items, not text, and an opaque grid is as evidence-free as a OneNote
-    /// canvas. Posting a real ⌘C there copies image/file data and stalls the capture, so those
-    /// targets keep the evidence requirement.
+    /// A drag across a Photos grid or Mail list selects items, not text. Row/container roles must
+    /// block weak contextual evidence such as an I-beam cursor.
     func testItemSelectionSurfaceStillRequiresEvidence() async {
         let tracker = CopyCallTracker()
         let coordinator = SelectionRetrievalCoordinator(
@@ -540,6 +580,30 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
         XCTAssertNil(result)
         let invoked = await tracker.copyInvoked
         XCTAssertFalse(invoked, "an item-selection surface must not get a speculative ⌘C")
+    }
+
+    /// Regression for issue 159: focused media is a structural item surface, not an opaque text
+    /// canvas eligible for speculative copy.
+    func testIssue159OpaqueMediaElementMustNotAuthorizeCopy() async {
+        let tracker = CopyCallTracker()
+        let mediaTarget = AXElementInspector.Target(role: "AXImage")
+        let coordinator = SelectionRetrievalCoordinator(
+            inspect: { mediaTarget },
+            copyCapture: { _ in
+                await tracker.recordCopy()
+                return nil
+            }
+        )
+
+        _ = await coordinator.retrieve(
+            for: AppIdentity(bundleIdentifier: "com.example.photos-like-app"),
+            policy: .default,
+            cursor: .unknown,
+            trigger: .doubleClick
+        )
+
+        let invoked = await tracker.copyInvoked
+        XCTAssertFalse(invoked, "an AXImage target must not receive speculative ⌘C")
     }
 
     /// Electron/Chromium apps are copy-classified but should read AX first (non-destructively)
@@ -717,10 +781,15 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
         XCTAssertEqual(counter.calls, 0, "A canvas drag must never post a synthetic ⌘C")
     }
 
-    func testCopyProceedsWithBeamCursorTextEvidence() async {
+    func testBeamCursorProvidesOnlyWeakCopyEvidence() async {
+        final class EvidenceBox: @unchecked Sendable { var evidence: CopyEvidence? }
+        let box = EvidenceBox()
         let coordinator = SelectionRetrievalCoordinator(
             inspect: { Self.opaqueTarget() },
-            copyCapture: { _ in SelectionResult(text: "captured via keyboard copy") }
+            copyCapture: { request in
+                box.evidence = request.evidence
+                return SelectionResult(text: "captured via keyboard copy")
+            }
         )
         let policy = AppPolicyContext(retrievalMode: .keyboardCopy)
         let result = await coordinator.retrieve(
@@ -729,6 +798,8 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
             cursor: .beam
         )
         XCTAssertEqual(result?.text, "captured via keyboard copy")
+        XCTAssertEqual(box.evidence?.reason, "beam-cursor")
+        XCTAssertEqual(box.evidence?.strength, .weak)
     }
 
     func testCopySkippedForAXWebAreaAncestorWithoutSelection() async {
@@ -751,16 +822,19 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
         XCTAssertEqual(counter.calls, 0, "AXWebArea ancestry alone is not text evidence")
     }
 
-    /// Regression: a web text input is exposed as a text control, but the pointer can read as a
-    /// hand (a link/button near the input) or unknown while the selection is made. The focused/
-    /// ancestor text-control role is structural evidence, so it must permit the copy fallback
-    /// regardless of the cursor class — gating it on the cursor left the input unreadable.
-    func testCopyProceedsForTextControlRoleRegardlessOfCursor() async {
+    /// Text-control role can authorize only a weak fallback; the real automatic capture requires
+    /// an enabled Copy menu for this verdict regardless of the pointer cursor.
+    func testTextControlRoleProvidesWeakEvidenceRegardlessOfCursor() async {
         let policy = AppPolicyContext(retrievalMode: .keyboardCopy)
         for cursor: CursorClass in [.pointingHand, .unknown, .arrow] {
+            final class EvidenceBox: @unchecked Sendable { var evidence: CopyEvidence? }
+            let box = EvidenceBox()
             let coordinator = SelectionRetrievalCoordinator(
                 inspect: { Self.opaqueTarget(containedInRoles: ["AXTextArea"]) },
-                copyCapture: { _ in SelectionResult(text: "captured via keyboard copy") }
+                copyCapture: { request in
+                    box.evidence = request.evidence
+                    return SelectionResult(text: "captured via keyboard copy")
+                }
             )
             let result = await coordinator.retrieve(
                 for: AppIdentity(bundleIdentifier: "com.google.Chrome"),
@@ -768,6 +842,7 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
                 cursor: cursor
             )
             XCTAssertEqual(result?.text, "captured via keyboard copy", "cursor=\(cursor.rawValue)")
+            XCTAssertEqual(box.evidence?.strength, .weak)
         }
     }
 

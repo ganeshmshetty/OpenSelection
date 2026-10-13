@@ -57,6 +57,36 @@ final class AutomaticCopyCaptureTests: XCTestCase {
         XCTAssertEqual(board.string(forType: .string), "Original clipboard")
     }
 
+    func testStrongAXEvidenceBypassesStrictWeakMenuRequirement() async {
+        let board = pasteboard()
+        defer { board.releaseGlobally() }
+        var triggers = 0
+        let request = CopyRequest(
+            trigger: {
+                triggers += 1
+                board.clearContents()
+                board.setString("Selected text", forType: .string)
+            },
+            evidence: CopyEvidence("ax-selected-text", .strong),
+            requiresEnabledCopyMenu: true
+        )
+
+        let result = await AutomaticCopyCapture.capture(
+            request: request,
+            pasteboard: board,
+            frontmostPID: { 42 },
+            menuState: { _ in
+                XCTFail("Strong selected-text evidence must bypass the menu probe")
+                return .unknown(.timeout)
+            },
+            overlayPresent: { false }
+        )
+
+        XCTAssertEqual(result?.text, "Selected text")
+        XCTAssertEqual(triggers, 1)
+        XCTAssertEqual(board.string(forType: .string), "Original clipboard")
+    }
+
     func testEnabledMenuCapturesAndRestoresClipboard() async {
         let board = pasteboard()
         defer { board.releaseGlobally() }
@@ -105,6 +135,96 @@ final class AutomaticCopyCaptureTests: XCTestCase {
         )
         XCTAssertEqual(triggers, 1)
         XCTAssertEqual(result?.text, "Selected text")
+        XCTAssertEqual(board.string(forType: .string), "Original clipboard")
+    }
+
+    func testStrictWeakEvidenceRequiresEnabledMenuBeforeTouchingClipboard() async {
+        let board = pasteboard()
+        defer { board.releaseGlobally() }
+        let changeCount = board.changeCount
+        var triggers = 0
+        let request = CopyRequest(
+            trigger: {
+                triggers += 1
+                XCTFail("Unknown menu state must not trigger copy for automatic retrieval")
+            },
+            evidence: CopyEvidence("ax-text-control", .weak),
+            requiresEnabledCopyMenu: true
+        )
+
+        let response = await AutomaticCopyCapture.captureResponse(
+            request: request,
+            pasteboard: board,
+            frontmostPID: { 42 },
+            menuState: { _ in .unknown(.timeout) },
+            overlayPresent: { false }
+        )
+
+        XCTAssertNil(response.result)
+        XCTAssertEqual(response.status, .copyBlocked)
+        XCTAssertEqual(triggers, 0)
+        XCTAssertEqual(board.changeCount, changeCount)
+        XCTAssertEqual(board.string(forType: .string), "Original clipboard")
+    }
+
+    func testStrictWeakEvidenceStillRunsWhenMenuEnabled() async {
+        let board = pasteboard()
+        defer { board.releaseGlobally() }
+        var triggers = 0
+        let request = CopyRequest(
+            trigger: {
+                triggers += 1
+                board.clearContents()
+                board.setString("Selected text", forType: .string)
+            },
+            evidence: CopyEvidence("ax-text-control", .weak),
+            requiresEnabledCopyMenu: true
+        )
+
+        let result = await AutomaticCopyCapture.capture(
+            request: request,
+            pasteboard: board,
+            frontmostPID: { 42 },
+            menuState: { _ in .enabled },
+            overlayPresent: { false }
+        )
+
+        XCTAssertEqual(result?.text, "Selected text")
+        XCTAssertEqual(triggers, 1)
+        XCTAssertEqual(board.string(forType: .string), "Original clipboard")
+    }
+
+    func testIssue159CoordinatorEmptyTextFieldWithUnknownMenuNeverCopies() async {
+        let board = pasteboard()
+        defer { board.releaseGlobally() }
+        let originalChangeCount = board.changeCount
+        let boardBox = PasteboardBox(board)
+        let configuration = SelectionConfiguration(evidenceSettleMaxRetries: 0)
+        let target = AXElementInspector.Target(role: "AXTextArea")
+        let coordinator = SelectionRetrievalCoordinator(
+            configuration: configuration,
+            inspect: { target },
+            detailedCopyCapture: { request in
+                await AutomaticCopyCapture.captureResponse(
+                    configuration: configuration,
+                    request: request,
+                    pasteboard: boardBox.pasteboard,
+                    frontmostPID: { 42 },
+                    menuState: { _ in .unknown(.timeout) },
+                    overlayPresent: { false }
+                )
+            }
+        )
+
+        let result = await coordinator.retrieve(
+            for: AppIdentity(bundleIdentifier: "com.microsoft.Outlook"),
+            policy: SelectionPolicy(strategy: .keyboardCopy),
+            cursor: .unknown,
+            trigger: .doubleClick
+        )
+
+        XCTAssertNil(result)
+        XCTAssertEqual(board.changeCount, originalChangeCount)
         XCTAssertEqual(board.string(forType: .string), "Original clipboard")
     }
 
@@ -255,4 +375,12 @@ final class AutomaticCopyCaptureTests: XCTestCase {
         XCTAssertTrue(recovered)
     }
 
+}
+
+private final class PasteboardBox: @unchecked Sendable {
+    let pasteboard: NSPasteboard
+
+    init(_ pasteboard: NSPasteboard) {
+        self.pasteboard = pasteboard
+    }
 }

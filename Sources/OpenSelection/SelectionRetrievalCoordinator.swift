@@ -33,10 +33,18 @@ public struct CopyEvidence: Sendable, Equatable {
 public struct CopyRequest: Sendable {
     public let trigger: SelectionRetrievalCoordinator.CopyTrigger
     public let evidence: CopyEvidence
+    /// Weak evidence may trigger copy only when the target's Copy command is confirmed enabled.
+    /// Defaults to false for compatibility with explicit/legacy capture callers.
+    public let requiresEnabledCopyMenu: Bool
 
-    public init(trigger: @escaping SelectionRetrievalCoordinator.CopyTrigger, evidence: CopyEvidence) {
+    public init(
+        trigger: @escaping SelectionRetrievalCoordinator.CopyTrigger,
+        evidence: CopyEvidence,
+        requiresEnabledCopyMenu: Bool = false
+    ) {
         self.trigger = trigger
         self.evidence = evidence
+        self.requiresEnabledCopyMenu = requiresEnabledCopyMenu
     }
 
     @MainActor
@@ -375,35 +383,13 @@ public struct SelectionRetrievalCoordinator: Sendable {
             "strategy": .token(policy.retrievalMode.rawValue)
         ])
 
-        // Waive the copy-evidence gate when a synthetic copy is the only read that can possibly
-        // succeed, decided structurally rather than by bundle identity:
-        // 1. The app is a known copy-fallback app (the OneNote allowlist), or
-        // 2. the inspect target exposes no text surface at all — no selected text/range, no text
-        //    role, no containing AXWebArea. An AX tree like that (OneNote-class native opaque
-        //    canvases) can never yield AX evidence, so requiring it permanently skips the one
-        //    strategy that works. Web/Electron canvases stay protected: an AXWebArea ancestor
-        //    makes the target text-bearing, so Figma-style object drags still require evidence.
-        //
-        // Item-selection surfaces are excluded from (2). A drag across a Photos grid, Mail list or
-        // Finder column selects *items*, not text, and an opaque grid is exactly as evidence-free as
-        // a OneNote canvas — but posting a real ⌘C there copies image/file data and stalls the
-        // capture for the full polling timeout, so those targets keep the evidence requirement.
-        let isItemSelectionSurface = target.role.map { Self.rowSelectionRoles.contains($0) } == true
-            || !target.containedInRoles.isDisjoint(with: Self.rowSelectionRoles)
-        let evidenceRequired = requireCopyEvidence
-            && !AppMatching.isCopyFallbackApp(app.bundleIdentifier)
-            && (Self.isTextBearing(target) || isItemSelectionSurface)
-        if requireCopyEvidence, !evidenceRequired, let bID = app.bundleIdentifier {
-            activeTrace.log(.debug, .gate, "copy allowed without ax evidence", fields: ["bundleID": .token(bID)])
-        }
-
         let readResult = Self.nonBlank(await read(
             for: app,
             target: target,
             policy: policy,
             cursor: cursor,
             allowCopyFallback: allowCopyFallback,
-            requireCopyEvidence: evidenceRequired,
+            requireCopyEvidence: requireCopyEvidence,
             trace: activeTrace
         ))
 
@@ -577,7 +563,14 @@ public struct SelectionRetrievalCoordinator: Sendable {
                     evidence = CopyEvidence("waived-ax-blind-surface", .strong)
                 }
             }
-            let (rawResult, outcome) = await run(strategy, app: app, target: target, evidence: evidence, trace: trace)
+            let (rawResult, outcome) = await run(
+                strategy,
+                app: app,
+                target: target,
+                evidence: evidence,
+                requiresEnabledCopyMenu: requireCopyEvidence,
+                trace: trace
+            )
             if trace.selectionReadStatus == .targetChanged || trace.selectionReadStatus == .cancelled {
                 return nil
             }
@@ -686,6 +679,7 @@ public struct SelectionRetrievalCoordinator: Sendable {
             app: app,
             target: target,
             evidence: CopyEvidence("rich-enrichment", .strong),
+            requiresEnabledCopyMenu: false,
             trace: trace
         )
         guard let captured = Self.nonBlank(capturedRaw),
@@ -754,6 +748,7 @@ public struct SelectionRetrievalCoordinator: Sendable {
         app: AppIdentity,
         target: AXElementInspector.Target,
         evidence: CopyEvidence? = nil,
+        requiresEnabledCopyMenu: Bool,
         trace: SelectionTrace? = nil
     ) async -> (result: SelectionResult?, outcome: StrategyOutcome) {
         switch strategy {
@@ -816,7 +811,11 @@ public struct SelectionRetrievalCoordinator: Sendable {
             default:
                 return (nil, .empty(.noSelection))
             }
-            let request = CopyRequest(trigger: trigger, evidence: evidence ?? CopyEvidence("unspecified", .weak))
+            let request = CopyRequest(
+                trigger: trigger,
+                evidence: evidence ?? CopyEvidence("unspecified", .weak),
+                requiresEnabledCopyMenu: requiresEnabledCopyMenu
+            )
             let response = await copyCapture(request)
             guard let captured = response.result else {
                 trace?.recordReadStatus(response.status)
@@ -1033,9 +1032,10 @@ public struct SelectionRetrievalCoordinator: Sendable {
     /// Without this, an app classified as copy-based fires ⌘C on every qualifying gesture — e.g.
     /// dragging a Figma object mutates Figma's selection and undo state instead of reading text.
     ///
-    /// Evidence is: an I-beam cursor (a text caret under the pointer), `AXSelectedText` with
-    /// content, a resolved `AXStringForTextMarkerRange` with content, a *non-empty*
-    /// `AXSelectedTextRange`, or the focused/ancestor element being a text control.
+    /// Strong evidence is `AXSelectedText` with content, a resolved
+    /// `AXStringForTextMarkerRange` with content, or a *non-empty* `AXSelectedTextRange`.
+    /// An I-beam cursor or text-control role is weak context evidence and needs a confirmed enabled
+    /// Copy menu before automatic capture can post a shortcut.
     /// `isTextBearing` is intentionally *not* used here: it returns true whenever
     /// `webArea != nil` or an ancestor is `AXWebArea`.
     ///
@@ -1069,14 +1069,16 @@ public struct SelectionRetrievalCoordinator: Sendable {
         let rangeLength = Self.rangeLength(of: target)
         if let len = rangeLength, len > 0 { return .init("ax-selected-text-range", .strong) }
 
+        // A text selection signal above wins over the focused element's broader structural role.
+        // Without one, image and collection/item surfaces describe selected objects, not text.
+        if Self.isNonTextSelectionContext(target) { return nil }
+
         let isTextControl = target.role.map { textEvidenceRoles.contains($0) } == true
             || !target.containedInRoles.isDisjoint(with: textEvidenceRoles)
 
         if cursor == .beam {
-            // A control that lacks confirmed selection text/range must let the menu veto (TextEdit whitespace drag or empty text field).
-            return isTextControl
-                ? .init("beam-cursor+text-control", .weak)
-                : .init("beam-cursor", .strong)
+            // The I-beam establishes a text context, but it does not prove text is selected.
+            return .init(isTextControl ? "beam-cursor+text-control" : "beam-cursor", .weak)
         }
         if isTextControl { return .init("ax-text-control", .weak) }
 
@@ -1141,8 +1143,26 @@ public struct SelectionRetrievalCoordinator: Sendable {
     }
 
     private static let rowSelectionRoles: Set<String> = [
-        "AXTable", "AXOutline", "AXBrowser", "AXList", "AXRow", "AXCell", "AXColumn", "AXGrid"
+        "AXTable", "AXOutline", "AXBrowser", "AXList", "AXRow", "AXCell", "AXColumn", "AXGrid", "AXCollection"
     ]
+
+    private static let nonTextSelectionRoles: Set<String> = rowSelectionRoles.union(["AXImage"])
+
+    private static func isNonTextSelectionContext(_ target: AXElementInspector.Target) -> Bool {
+        // An element that is itself an image or collection remains a non-text surface until a
+        // strong selected-text signal above proves otherwise.
+        if target.role == "AXImage" || target.role == "AXCollection" { return true }
+
+        // Editable controls nested in rows/collections are legitimate text surfaces. Let their
+        // weak role evidence settle and require the enabled-menu check if AX still lags.
+        if target.role.map({ textEvidenceRoles.contains($0) }) == true
+            || !target.containedInRoles.isDisjoint(with: textEvidenceRoles) {
+            return false
+        }
+
+        if let role = target.role, nonTextSelectionRoles.contains(role) { return true }
+        return !target.containedInRoles.isDisjoint(with: nonTextSelectionRoles)
+    }
 
     private static func isRowSelectionContext(_ target: AXElementInspector.Target) -> Bool {
         if isTextBearing(target) { return false }

@@ -30,7 +30,7 @@ Before adding a bundle ID check, exhaust these structural alternatives:
    - Check `isTextBearing` (`AXTextField`, `AXTextArea`, `AXWebArea`, ancestor roles).
    - Check `isEditableContext` (`selectedTextRange != nil`, settable attributes via `AXUIElementIsAttributeSettable`).
    - Check `rowSelectionRoles` (`AXTable`, `AXOutline`, `AXRow`, `AXCell`) to prevent copying list selections as text.
-   - Check structural absence of text surfaces: the OneNote copy waiver is structural — if an app exposes *zero* AX text surfaces and *no* `AXWebArea`, it is allowed to use copy fallback without requiring an allowlist entry.
+   - Absence of AX text surfaces does not authorize automatic Copy. Evidence-required retrieval must retain its gate on opaque media/canvas targets; explicit callers may opt out with `requireCopyEvidence: false`.
 2. **Cursor Geometry & Silhouettes**:
    - Do not assume an app uses standard cursor names. Use `CursorClassifier.current` / `CursorClassifier.classify(_:)`, which analyzes pixel alpha silhouettes (`.beam`, `.arrow`, `.pointingHand`) from `NSCursor.currentSystem` across all apps.
 3. **Window Server Geometry**:
@@ -93,8 +93,8 @@ Synthetic keystrokes (`⌘C`, `⌘V`) and `Edit ▸ Copy` menu presses post real
   │ Layer 2: Evidence & Menu Pre-Gate (AutomaticCopyCapture)│
   │   - Check foreign overlay (CopyTriggerGate)             │
   │   - Require text evidence for copy strategies           │
-  │   - For native text controls: require enabled ⌘C menu   │
-  │   - Terminals & Browsers bypass menu walk               │
+  │   - For weak automatic evidence: require enabled ⌘C menu   │
+  │   - Strong selection evidence bypasses menu walk               │
   └─────────────────────────────────────────────────────────┘
              │
              ▼
@@ -102,8 +102,8 @@ Synthetic keystrokes (`⌘C`, `⌘V`) and `Edit ▸ Copy` menu presses post real
 ```
 
 - **Layer 1 (Geometry Guard)**: Protects against TextEdit/Notes title bar dragging (Issue #123) and window management moves. If the window moved or resized, retrieval is dropped before touching the clipboard.
-- **Layer 2 (Evidence & Menu Gate)**: Protects against Figma canvas object duplication (Issue #121) and empty text control alert beeps. Canvas tools must provide `copyEvidence` (caret cursor, non-empty range, or text-bearing role) before any copy is fired.
-- **Terminal & Browser Bypass**: Terminals and multi-process browsers handle shortcuts internally or suffer IPC latency. They bypass the AX menu bar walk and use direct pasteboard capture with geometry guards.
+- **Layer 2 (Evidence & Menu Gate)**: Protects against Figma canvas object duplication (Issue #121) and empty text control alert beeps. Canvas tools must provide selection evidence before Copy. Nonempty selected text, marker text, or a positive range is strong; cursor and text-control roles are weak and need confirmed enabled Copy when evidence is required.
+- **Compatibility**: Strong selection evidence bypasses the menu walk. Explicit evidence opt-outs and legacy `CopyRequest` construction retain permissive unknown-menu handling; weak evidence-required automatic capture does not bypass the gate by app identity.
 
 ---
 

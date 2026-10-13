@@ -49,12 +49,15 @@ final class DiagnosticsPipelineTests: XCTestCase {
         DiagnosticsHub.shared.removeAllSinks()
         DiagnosticsHub.shared.install(sink)
         let reader = SelectionRetrievalCoordinator(
-            inspect: { _ in AXElementInspector.Target() },
+            inspect: { _ in AXElementInspector.Target(selectedText: "selected") },
             detailedCopyCapture: { _ in
                 await Task { DiagnosticsHub.shared.log(.trace, .pasteboard, "capture detail") }.value
                 return .init(result: SelectionResult(text: "text", strategy: .keyboardCopy), status: .selection)
             })
-        let response = await reader.retrieveResponse()
+        let response = await reader.retrieveResponse(
+            for: AppIdentity(bundleIdentifier: "com.test"),
+            policy: SelectionPolicy(strategy: .keyboardCopy)
+        )
         await DiagnosticsHub.shared.flush()
         let events = sink.events.withLock { $0 }
         XCTAssertTrue(events.contains { $0.message == "capture detail" })
