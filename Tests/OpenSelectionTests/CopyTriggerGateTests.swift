@@ -7,6 +7,23 @@ final class CopyTriggerGateTests: XCTestCase {
     private let frontmost: pid_t = 200
     private let display = CGRect(x: 0, y: 0, width: 1470, height: 956)
 
+    func testExplicitCopyIsNotBlockedByARecordingSystemPanel() {
+        let point = CGPoint(x: 500, y: 400)
+        let windows = [OnScreenWindowInfo(ownerPID: 999, ownerBundleID: "com.apple.controlcenter", layer: 25,
+                                          frame: CGRect(x: 450, y: 350, width: 200, height: 100))]
+        XCTAssertTrue(CopyTriggerGate.isForeignOverlay(windows: windows, at: point, frontmostPID: frontmost,
+                                                      selfPID: selfPID, displayBounds: display))
+        XCTAssertFalse(CopyTriggerGate.isForeignOverlay(windows: windows, at: point, frontmostPID: frontmost,
+                                                       selfPID: selfPID, displayBounds: display, intent: .explicitUserCopy))
+    }
+
+    func testExplicitCopyStillRefusesAnActiveCapturePicker() {
+        let windows = [OnScreenWindowInfo(ownerPID: 999, ownerBundleID: "com.Snipaste", layer: 100, frame: display)]
+        XCTAssertTrue(CopyTriggerGate.isForeignOverlay(windows: windows, at: CGPoint(x: 500, y: 400),
+                                                      frontmostPID: frontmost, selfPID: selfPID,
+                                                      displayBounds: display, intent: .explicitUserCopy))
+    }
+
     /// A foreign capture tool's full-screen picker (elevated, display-covering) owns the key window
     /// and would swallow the synthetic ⌘C, so the copy must be suppressed.
     func testForeignFullScreenElevatedOverlaySuppresses() {

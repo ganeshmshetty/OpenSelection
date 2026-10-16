@@ -46,7 +46,20 @@ public struct PasteboardCopyEngine {
         pasteboard: NSPasteboard = .general,
         timeout: TimeInterval? = nil,
         restoreDelay: TimeInterval? = nil,
+        priority: PasteboardOperationPriority = .backgroundCapture,
         trigger: CopyTrigger
+    ) async -> SelectionReadResponse {
+        await captureResponse(pasteboard: pasteboard, timeout: timeout, restoreDelay: restoreDelay,
+                              priority: priority, asyncTrigger: { trigger() })
+    }
+
+    /// Explicit action-time reads can await a menu command while retaining clipboard ownership.
+    public func captureResponse(
+        pasteboard: NSPasteboard = .general,
+        timeout: TimeInterval? = nil,
+        restoreDelay: TimeInterval? = nil,
+        priority: PasteboardOperationPriority = .backgroundCapture,
+        asyncTrigger: @MainActor () async -> Void
     ) async -> SelectionReadResponse {
         let trace = SelectionTrace.current
         let phaseStart = trace?.elapsedMicros ?? 0
@@ -59,9 +72,15 @@ public struct PasteboardCopyEngine {
             return SelectionReadResponse(status: authorizationFailure?() ?? .copyBlocked)
         }
 
-        guard let session = PasteboardCoordinator.shared.beginSession(priority: .backgroundCapture, pasteboard: pasteboard) else {
+        let acquired: PasteboardSession?
+        if priority == .userAction {
+            acquired = try? await PasteboardCoordinator.shared.acquireSession(priority: priority, pasteboard: pasteboard)
+        } else {
+            acquired = PasteboardCoordinator.shared.beginSession(priority: priority, pasteboard: pasteboard)
+        }
+        guard let session = acquired else {
             DiagnosticsHub.shared.log(.trace, .pasteboard, "copy engine suppressed, active higher-priority pasteboard session")
-            return SelectionReadResponse(status: .busy)
+            return SelectionReadResponse(status: Task.isCancelled ? .cancelled : .busy)
         }
         let initialChangeCount = pasteboard.changeCount
 
@@ -80,13 +99,17 @@ public struct PasteboardCopyEngine {
         defer { if let keyMonitor { NSEvent.removeMonitor(keyMonitor) } }
 
         guard !session.isCancelled else { return SelectionReadResponse(status: .cancelled) }
+        guard !Task.isCancelled, isCopyAuthorized() else {
+            session.commitPermanent()
+            return SelectionReadResponse(status: Task.isCancelled ? .cancelled : (authorizationFailure?() ?? .copyBlocked))
+        }
 
         defer {
             PasteboardCoordinator.shared.markCaptureFinished(for: session)
         }
         trace?.recordClipboardRestored(false)
         PasteboardCoordinator.shared.markCopyPosted(for: session)
-        trigger()
+        await asyncTrigger()
 
         let resolvedTimeout = timeout ?? Self.pollingTimeout(for: NSWorkspace.shared.frontmostApplication?.bundleIdentifier, configuration: configuration)
         let pollInterval: TimeInterval = 0.001

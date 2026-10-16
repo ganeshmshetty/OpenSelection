@@ -528,7 +528,8 @@ public struct SelectionRetrievalCoordinator: Sendable {
                         target: target,
                         cursor: cursor,
                         bundleID: app.bundleIdentifier,
-                        isFallbackFromAX: index > 0
+                        isFallbackFromAX: index > 0,
+                        trigger: trace.trigger
                     ) {
                         let ev = await settledCopyEvidence(
                             initial,
@@ -546,9 +547,12 @@ public struct SelectionRetrievalCoordinator: Sendable {
                         ])
                     } else {
                         trace.recordReadStatus(.copyBlocked)
-                        trace.log(.trace, .gate, "copy strategy skipped, no evidence", fields: [
+                        trace.log(.debug, .gate, "copy strategy skipped, no evidence", fields: [
                             "bundleID": .token(bundleID),
-                            "strategy": .token(strategy.rawValue)
+                            "strategy": .token(strategy.rawValue),
+                            "cursor": .token(cursor.rawValue),
+                            "role": .token(target.role ?? "none"),
+                            "ancestorRoles": .token(target.containedInRoles.sorted().joined(separator: ","))
                         ])
                         let duration = UInt32(min(UInt64(UInt32.max), trace.elapsedMicros - UInt64(attemptStart)))
                         trace.recordAttempt(StrategyAttempt(
@@ -1058,7 +1062,8 @@ public struct SelectionRetrievalCoordinator: Sendable {
         target: AXElementInspector.Target,
         cursor: CursorClass,
         bundleID: String? = nil,
-        isFallbackFromAX: Bool = false
+        isFallbackFromAX: Bool = false,
+        trigger: TriggerSource? = nil
     ) -> CopyEvidence? {
         guard strategy == .keyboardCopy || strategy == .menuCopy else { return nil }
 
@@ -1086,8 +1091,22 @@ public struct SelectionRetrievalCoordinator: Sendable {
             if isFallbackFromAX { return .init("ax-empty-browser-fallback", .weak) }
             if cursor == .unknown || cursor == .pointingHand { return .init("browser-cursor:\(cursor.rawValue)", .weak) }
         }
+        // Electron pages often show an arrow or custom cursor over selectable text, and with no
+        // AX tree the selection is invisible to AX. A completed drag or multi-click is still
+        // selection intent; as weak evidence it posts Copy only if the Copy command is confirmed
+        // enabled. A web area that AX *does* expose and that reports no selected text is a
+        // contrary signal (a Figma canvas object drag), so it never qualifies.
+        let exposesWebContent = target.webArea != nil || target.role == "AXWebArea"
+            || target.containedInRoles.contains("AXWebArea")
+        if let trigger, selectionGestureTriggers.contains(trigger), !exposesWebContent {
+            return .init("selection-gesture:\(trigger.raw)", .weak)
+        }
         return nil
     }
+
+    /// Triggers that fire only after the monitor confirmed a drag past the movement threshold
+    /// or a multi-click. A press-and-hold or keyboard trigger is not selection intent by itself.
+    static let selectionGestureTriggers: [TriggerSource] = [.dragEnd, .doubleClick, .mouseUp]
 
     /// Upgrades a weak text-control evidence verdict by briefly re-inspecting the target.
     ///
@@ -1124,7 +1143,8 @@ public struct SelectionRetrievalCoordinator: Sendable {
                 target: fresh,
                 cursor: cursor,
                 bundleID: bundleID,
-                isFallbackFromAX: isFallbackFromAX
+                isFallbackFromAX: isFallbackFromAX,
+                trigger: trace.trigger
             ), candidate.strength > evidence.strength
             else { continue }
             trace.log(.trace, .gate, "copy evidence settled", fields: [

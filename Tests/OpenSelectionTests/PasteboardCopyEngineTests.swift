@@ -3,6 +3,54 @@ import AppKit
 @testable import OpenSelection
 
 final class PasteboardCopyEngineTests: XCTestCase {
+    @MainActor
+    func testExplicitCaptureAwaitsOwnershipAndMenuStyleTriggerThenRestoresClipboard() async throws {
+        let board = NSPasteboard(name: .init("com.openselection.explicit-capture.\(UUID().uuidString)"))
+        defer { board.releaseGlobally() }
+        board.setString("Original", forType: .string)
+        let occupied = try await PasteboardCoordinator.shared.acquireSession(priority: .userAction, pasteboard: board)
+        var checked = false
+        var posted = false
+        let engine = PasteboardCopyEngine(isCopyAuthorized: { checked = true; return true })
+        let task = Task {
+            await engine.captureResponse(pasteboard: board, priority: .userAction, asyncTrigger: {
+                await Task.yield()
+                posted = true
+                board.clearContents()
+                board.setString("Styled", forType: .string)
+                board.setString("<b>Styled</b>", forType: .html)
+            })
+        }
+        while !checked { await Task.yield() }
+        XCTAssertFalse(posted)
+        occupied.commitPermanent()
+        let response = await task.value
+        XCTAssertEqual(response.status, .selection)
+        XCTAssertNotNil(response.result?.rtf)
+        XCTAssertEqual(board.string(forType: .string), "Original")
+    }
+
+    @MainActor
+    func testCancellingAQueuedExplicitCaptureDoesNotPostCopy() async throws {
+        let board = NSPasteboard(name: .init("com.openselection.explicit-capture.\(UUID().uuidString)"))
+        defer { board.releaseGlobally() }
+        board.setString("Original", forType: .string)
+        let occupied = try await PasteboardCoordinator.shared.acquireSession(priority: .userAction, pasteboard: board)
+        var checked = false
+        var posted = false
+        let engine = PasteboardCopyEngine(isCopyAuthorized: { checked = true; return true })
+        let task = Task {
+            await engine.captureResponse(pasteboard: board, priority: .userAction, trigger: { posted = true })
+        }
+        while !checked { await Task.yield() }
+        task.cancel()
+        occupied.commitPermanent()
+        let response = await task.value
+        XCTAssertEqual(response.status, .cancelled)
+        XCTAssertFalse(posted)
+        XCTAssertEqual(board.string(forType: .string), "Original")
+    }
+
     private static let pasteboardName = NSPasteboard.Name("com.openselection.tests.copyengine")
 
     @MainActor

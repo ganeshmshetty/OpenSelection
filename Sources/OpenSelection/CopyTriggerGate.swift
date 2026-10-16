@@ -34,6 +34,7 @@ public struct OnScreenWindowInfo: Equatable, Sendable {
 }
 
 public enum CopyTriggerGate {
+    public enum Intent: Sendable { case automaticCapture, explicitUserCopy }
     /// Bundle identifiers of system chrome — always-present windows that sit above app windows and
     /// can cover a display, but never own an app's key window, so a synthetic ⌘C is never delivered
     /// to them. The Dock's full-screen window (layer 20) is the canonical case: on macOS 26 with the
@@ -103,7 +104,8 @@ public enum CopyTriggerGate {
         at point: CGPoint,
         frontmostPID: pid_t?,
         selfPID: pid_t,
-        displayBounds: CGRect? = nil
+        displayBounds: CGRect? = nil,
+        intent: Intent = .automaticCapture
     ) -> Bool {
         // Without a known frontmost app or display there is nothing to reason about: fail open.
         guard let frontmostPID, let displayBounds else { return false }
@@ -129,6 +131,9 @@ public enum CopyTriggerGate {
         }
 
         if let bundleID = top.ownerBundleID, systemUIBundleIDs.contains(bundleID) && top.layer > 0 {
+            // A user clicked Copy and its caller has reactivated/validated the source app.
+            // Recording/share indicators and floating system panels are not capture pickers.
+            if intent == .explicitUserCopy { return false }
             // A System UI *panel* can swallow the copy even though it does not cover the display.
             // Its display-covering backdrop is a transparent click-catcher, not a panel: treating
             // it as an overlay suppressed every copy on screen for as long as it was up.
@@ -146,7 +151,7 @@ public enum CopyTriggerGate {
 
     /// True when a foreign overlay sits at `point` right now. Inert under XCTest so unit tests never
     /// depend on the live window server; the pure `isForeignOverlay` is exercised directly instead.
-    public static func isForeignOverlayPresent(at point: CGPoint) -> Bool {
+    public static func isForeignOverlayPresent(at point: CGPoint, intent: Intent = .automaticCapture) -> Bool {
         guard NSClassFromString("XCTestCase") == nil else { return false }
         let display = NSScreen.screens.first(where: { $0.frame.contains(point) })?.frame
         let windows = systemWindows()
@@ -156,12 +161,13 @@ public enum CopyTriggerGate {
             at: point,
             frontmostPID: frontmostPID,
             selfPID: ProcessInfo.processInfo.processIdentifier,
-            displayBounds: display
+            displayBounds: display,
+            intent: intent
         )
         // Log the decision inputs only when we refuse, so a false positive is diagnosable from a
         // user's log dump instead of being an invisible "no selection".
         if suppressed {
-            let top = windows.first { $0.layer >= 0 && $0.alpha > 0 && $0.frame.contains(point) }
+            let top = windows.first { $0.layer >= 0 && $0.alpha > 0 && $0.frame.contains(point) && canOwnKeyWindow($0) }
             DiagnosticsHub.shared.log(.info, .gate, "copy gate suppressed by foreign overlay", fields: [
                 "frontmostPID": .int(Int64(frontmostPID ?? -1)),
                 "selfPID": .int(Int64(ProcessInfo.processInfo.processIdentifier)),

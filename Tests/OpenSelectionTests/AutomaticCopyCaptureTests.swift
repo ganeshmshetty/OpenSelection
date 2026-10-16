@@ -1,5 +1,6 @@
 import XCTest
 import AppKit
+import os
 @testable import OpenSelection
 
 @MainActor
@@ -165,6 +166,38 @@ final class AutomaticCopyCaptureTests: XCTestCase {
         XCTAssertEqual(triggers, 0)
         XCTAssertEqual(board.changeCount, changeCount)
         XCTAssertEqual(board.string(forType: .string), "Original clipboard")
+    }
+
+    /// A blocked Chromium read must say why in a default (debug-level) log dump, not only at trace.
+    func testMenuGateBlockIsLoggedAtDebugWithStateAndEvidence() async {
+        final class DebugSink: OpenSelectionDiagnosticsSink, @unchecked Sendable {
+            let minimumLevel: LogLevel = .debug
+            let events = OSAllocatedUnfairLock<[DiagnosticEvent]>(initialState: [])
+            func record(_ event: DiagnosticEvent) { events.withLock { $0.append(event) } }
+            func finish(_ report: CascadeReport) {}
+        }
+        DiagnosticsHub.shared.reset()
+        let sink = DebugSink()
+        DiagnosticsHub.shared.install(sink)
+        defer { DiagnosticsHub.shared.reset() }
+        let board = pasteboard()
+        defer { board.releaseGlobally() }
+
+        let response = await AutomaticCopyCapture.captureResponse(
+            request: CopyRequest(trigger: {}, evidence: CopyEvidence("selection-gesture:dragEnd", .weak),
+                                 requiresEnabledCopyMenu: true),
+            pasteboard: board,
+            frontmostPID: { 42 },
+            menuState: { _ in .disabled },
+            overlayPresent: { false }
+        )
+        await DiagnosticsHub.shared.flush()
+
+        XCTAssertEqual(response.status, .copyBlocked)
+        let blocked = sink.events.withLock { $0 }.first { $0.message.contains("without enabled Copy command") }
+        XCTAssertEqual(blocked?.level, .debug)
+        XCTAssertNotNil(blocked?.fields["menuState"])
+        XCTAssertNotNil(blocked?.fields["evidence"])
     }
 
     func testStrictWeakEvidenceStillRunsWhenMenuEnabled() async {

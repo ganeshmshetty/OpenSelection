@@ -933,6 +933,74 @@ final class SelectionRetrievalCoordinatorTests: XCTestCase {
         XCTAssertEqual(counter.calls, 0, ".unknown cursor must not justify ⌘C on a canvas")
     }
 
+    // MARK: - Selection-gesture evidence
+
+    final class CopyRequestBox: @unchecked Sendable { var requests: [CopyRequest] = [] }
+
+    private func gestureRetrieve(
+        target: AXElementInspector.Target, cursor: CursorClass, trigger: TriggerSource
+    ) async -> (SelectionResult?, CopyRequestBox) {
+        let box = CopyRequestBox()
+        let coordinator = SelectionRetrievalCoordinator(
+            inspect: { target },
+            copyCapture: { request in
+                box.requests.append(request)
+                return SelectionResult(text: "copied via gesture")
+            }
+        )
+        let result = await coordinator.retrieve(
+            for: AppIdentity(bundleIdentifier: "com.anthropic.claudefordesktop"),
+            policy: AppPolicyContext(retrievalMode: .keyboardCopy),
+            cursor: cursor,
+            trigger: trigger
+        )
+        return (result, box)
+    }
+
+    /// An Electron app with no AX tree (Claude before AXManualAccessibility) reports no role at
+    /// all and an arrow/custom cursor over its text. A real drag or multi-click must still reach
+    /// Copy, gated on an enabled Copy command.
+    func testSelectionGestureWithoutAXTreeIsWeakEvidenceRequiringEnabledCopy() async {
+        for trigger: TriggerSource in [.dragEnd, .doubleClick, .mouseUp] {
+            for cursor: CursorClass in [.arrow, .unknown, .pointingHand] {
+                let (result, box) = await gestureRetrieve(target: Self.opaqueTarget(), cursor: cursor, trigger: trigger)
+                XCTAssertEqual(result?.text, "copied via gesture", "\(trigger) \(cursor)")
+                XCTAssertEqual(box.requests.first?.evidence.reason, "selection-gesture:\(trigger.raw)")
+                XCTAssertEqual(box.requests.first?.evidence.strength, .weak)
+                XCTAssertEqual(box.requests.first?.requiresEnabledCopyMenu, true,
+                               "gesture evidence must never bypass the Copy-menu gate")
+            }
+        }
+    }
+
+    func testNonGestureTriggersAreNotSelectionEvidence() async {
+        for trigger: TriggerSource in [.programmatic, .keyboardShortcut, TriggerSource(raw: "mouseHold")] {
+            let (result, box) = await gestureRetrieve(target: Self.opaqueTarget(), cursor: .arrow, trigger: trigger)
+            XCTAssertNil(result, "\(trigger)")
+            XCTAssertTrue(box.requests.isEmpty, "\(trigger) is not a completed selection gesture")
+        }
+    }
+
+    /// A Figma canvas object drag: AX exposes the web area and it reports no selected text.
+    /// That contradicts the gesture, so no ⌘C may be posted.
+    func testGestureOverExposedWebAreaWithoutSelectionIsNotEvidence() async {
+        for target in [Self.opaqueTarget(containedInRoles: ["AXWebArea"]), Self.markerRangeTarget()] {
+            for trigger: TriggerSource in [.dragEnd, .doubleClick] {
+                let (result, box) = await gestureRetrieve(target: target, cursor: .unknown, trigger: trigger)
+                XCTAssertNil(result)
+                XCTAssertTrue(box.requests.isEmpty, "a canvas drag must never post a synthetic ⌘C")
+            }
+        }
+    }
+
+    func testGestureOnItemOrImageSurfaceIsNotEvidence() async {
+        for target in [Self.opaqueTarget(containedInRoles: ["AXList"]), AXElementInspector.Target(role: "AXImage")] {
+            let (result, box) = await gestureRetrieve(target: target, cursor: .arrow, trigger: .doubleClick)
+            XCTAssertNil(result)
+            XCTAssertTrue(box.requests.isEmpty, "selected objects are not selected text")
+        }
+    }
+
     func testMarkerTextIsTextEvidence() async {
         final class Counter: @unchecked Sendable { var calls = 0 }
         let counter = Counter()

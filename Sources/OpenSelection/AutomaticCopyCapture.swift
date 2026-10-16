@@ -204,7 +204,7 @@ public enum AutomaticCopyCapture {
             ])
             if request.requiresEnabledCopyMenu {
                 guard state == .enabled else {
-                    DiagnosticsHub.shared.log(.trace, .pasteboard, "automatic copy skipped without enabled Copy command", fields: [
+                    DiagnosticsHub.shared.log(.debug, .pasteboard, "automatic copy skipped without enabled Copy command", fields: [
                         "pid": .int(Int64(pid)),
                         "menuState": .token("\(state)"),
                         "evidence": .token(request.evidence.reason)
@@ -212,7 +212,7 @@ public enum AutomaticCopyCapture {
                     return SelectionReadResponse(status: .copyBlocked)
                 }
             } else if state == .disabled {
-                DiagnosticsHub.shared.log(.trace, .pasteboard, "automatic copy skipped, copy disabled under weak evidence", fields: [
+                DiagnosticsHub.shared.log(.debug, .pasteboard, "automatic copy skipped, copy disabled under weak evidence", fields: [
                     "pid": .int(Int64(pid)),
                     "menuState": .token("\(state)")
                 ])
